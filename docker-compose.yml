@@ -12,6 +12,9 @@ services:
     environment:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID in .env}
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      GOOGLE_CLIENT_IDS: ${GOOGLE_CLIENT_IDS:-}
+      GOOGLE_DESKTOP_CLIENT_ID: ${GOOGLE_DESKTOP_CLIENT_ID:-}
+      GOOGLE_DESKTOP_CLIENT_SECRET: ${GOOGLE_DESKTOP_CLIENT_SECRET:-}
       PUBLIC_URL: ${PUBLIC_URL:-https://sync.thestoreisclosed.co.uk}
       DATA_DIR: /data
       TZ: ${TZ:-Europe/London}

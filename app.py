@@ -1,12 +1,12 @@
 """stream-thing-sync: accounts, encrypted API keys and watch progress for stream-thing.
 
 One file on purpose: a FastAPI app over a single SQLite database. See README.md
-for the API contract. Secrets (SECRET_KEY) come from the environment only.
+for the API contract. Secrets (SECRET_KEY, GOOGLE_DESKTOP_CLIENT_SECRET) come
+from the environment only.
 
-Nothing secret is ever logged: not device tokens, session ids, link codes,
-device secrets, Google ID tokens or API keys. uvicorn's access log is turned off
-(it would print `/link?code=...`); the middleware below logs paths without
-query strings instead.
+Nothing secret is ever logged: not device tokens, session ids, Google ID
+tokens, OAuth codes/verifiers or API keys. uvicorn's access log is turned off
+(it would print query strings); the middleware below logs paths only.
 """
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -40,16 +41,12 @@ if not log.handlers:
 
 # --- constants ---------------------------------------------------------------
 
-CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/1/I/L
-CODE_LENGTH = 8
-LINK_TTL_S = 600
-LINK_POLL_INTERVAL_S = 5
-POLL_MIN_INTERVAL_S = 1.8  # "about one per 2s", with a little jitter tolerance
 SESSION_COOKIE = "sts_session"
 SESSION_TTL_S = 60 * 24 * 3600
 CSRF_HEADER = "x-requested-with"
 CSRF_VALUE = "sync"
-CREDENTIAL_KEYS = ("torbox", "mdblist", "poster")
+CREDENTIAL_KEYS = ("debrid_service", "torbox", "realdebrid", "mdblist", "poster")
+DEBRID_SERVICES = ("torbox", "realdebrid")
 MAX_CREDENTIAL_LEN = 512
 MAX_PROGRESS_ENTRIES = 500
 MAX_DEVICE_NAME_LEN = 80
@@ -57,7 +54,8 @@ MAX_BODY_BYTES = 1_000_000
 MAX_NUMBER = 1e10
 LAST_USED_RESOLUTION_MS = 60_000
 VIDEO_ID_RE = re.compile(r"^[\x21-\x7e]{1,200}$")  # printable ASCII, no spaces
-SCHEMA_VERSION = 1
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+SCHEMA_VERSION = 2
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -74,23 +72,93 @@ def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def verify_google_token(credential: str, client_id: str) -> dict:
-    """Verify a Google Identity Services ID token. Tests monkeypatch this."""
+# --- Google ------------------------------------------------------------------
+
+
+def verify_google_token(credential: str, audience: str | list[str]) -> dict:
+    """Verify a Google ID token against one client ID or a list of them.
+
+    Raises ValueError / GoogleAuthError when invalid. Tests monkeypatch this."""
     from google.auth.transport import requests as google_requests
     from google.oauth2 import id_token
 
-    return id_token.verify_oauth2_token(credential, google_requests.Request(), client_id)
+    return id_token.verify_oauth2_token(credential, google_requests.Request(), audience)
+
+
+class GoogleCodeRejected(Exception):
+    """Google refused the authorization code (bad, expired, reused, wrong verifier...)."""
+
+
+class GoogleUnavailable(Exception):
+    """Couldn't reach Google, or it refused our client configuration."""
+
+
+def exchange_google_code(code: str, code_verifier: str, redirect_uri: str,
+                         client_id: str, client_secret: str) -> dict:
+    """Exchange an authorization code (PKCE) at Google's token endpoint and return
+    its JSON response, which carries `id_token`. Tests monkeypatch this."""
+    import requests
+
+    try:
+        r = requests.post(GOOGLE_TOKEN_URL, timeout=10, data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": code_verifier,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        })
+    except requests.RequestException as exc:
+        raise GoogleUnavailable(type(exc).__name__) from None
+    if r.status_code in (400, 401):
+        try:
+            error = str(r.json().get("error", "invalid_grant"))
+        except ValueError:
+            error = "invalid_grant"
+        if error in ("invalid_client", "unauthorized_client"):
+            raise GoogleUnavailable(f"token endpoint rejected the client: {error}")
+        raise GoogleCodeRejected(error)
+    if r.status_code != 200:
+        raise GoogleUnavailable(f"token endpoint returned {r.status_code}")
+    try:
+        return r.json()
+    except ValueError:
+        raise GoogleUnavailable("token endpoint returned non-JSON") from None
+
+
+def valid_loopback_redirect(uri) -> bool:
+    """Only http://127.0.0.1:<port>/... or http://localhost:<port>/... (desktop loopback flow)."""
+    if not isinstance(uri, str) or len(uri) > 512:
+        return False
+    try:
+        parts = urlsplit(uri)
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "http"
+            and port is not None and 0 < port < 65536
+            and parts.netloc.lower() in (f"127.0.0.1:{port}", f"localhost:{port}")
+            and (parts.path == "" or parts.path.startswith("/"))
+            and not parts.fragment)
 
 
 # --- settings ----------------------------------------------------------------
 
 
+def _split_ids(value: str) -> tuple[str, ...]:
+    return tuple(x.strip() for x in value.split(",") if x.strip())
+
+
 @dataclass
 class Settings:
-    google_client_id: str
+    google_client_id: str  # the web client: website sign-in, and always an accepted app audience
     secret_key: str
     public_url: str
     data_dir: str
+    # Extra audiences accepted by POST /api/auth/google.
+    google_client_ids: tuple[str, ...] = ()
+    desktop_client_id: str = ""
+    desktop_client_secret: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -102,7 +170,14 @@ class Settings:
             secret_key=os.environ["SECRET_KEY"].strip(),
             public_url=os.environ.get("PUBLIC_URL", "https://sync.thestoreisclosed.co.uk").strip().rstrip("/"),
             data_dir=os.environ.get("DATA_DIR", "/data").strip(),
+            google_client_ids=_split_ids(os.environ.get("GOOGLE_CLIENT_IDS", "")),
+            desktop_client_id=os.environ.get("GOOGLE_DESKTOP_CLIENT_ID", "").strip(),
+            desktop_client_secret=os.environ.get("GOOGLE_DESKTOP_CLIENT_SECRET", "").strip(),
         )
+
+    @property
+    def app_audiences(self) -> list[str]:
+        return list(dict.fromkeys((self.google_client_id,) + tuple(self.google_client_ids)))
 
     @property
     def secure_cookies(self) -> bool:
@@ -149,28 +224,19 @@ CREATE TABLE IF NOT EXISTS devices (
     last_used_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS devices_user ON devices(user_id);
-CREATE TABLE IF NOT EXISTS link_requests (
-    secret_hash TEXT PRIMARY KEY,
-    code        TEXT NOT NULL UNIQUE,
-    device_name TEXT NOT NULL,
-    created_at  INTEGER NOT NULL,
-    expires_at  INTEGER NOT NULL,
-    user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    approved_at INTEGER
-);
 CREATE TABLE IF NOT EXISTS credentials (
     user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     blob       BLOB NOT NULL,
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS progress (
-    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    video_id          TEXT NOT NULL,
-    position          REAL,
-    duration          REAL,
-    watched           INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL,
-    changed_at INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    video_id   TEXT NOT NULL,
+    position   REAL,
+    duration   REAL,
+    watched    INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,  -- the device's clock: decides which write wins
+    changed_at INTEGER NOT NULL,  -- the server's clock: what `since` filters on
     PRIMARY KEY (user_id, video_id)
 );
 CREATE INDEX IF NOT EXISTS progress_since ON progress(user_id, changed_at);
@@ -186,7 +252,9 @@ class Database:
             c.executescript(SCHEMA)
             row = c.execute("SELECT MAX(version) FROM schema_version").fetchone()
             current = row[0] or 0
-            # Future migrations go here: `if current < 2: ...`.
+            if current < 2:
+                # v2: the device-code sign-in flow was removed.
+                c.execute("DROP TABLE IF EXISTS link_requests")
             if current < SCHEMA_VERSION:
                 c.execute("DELETE FROM schema_version")
                 c.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -233,26 +301,6 @@ class TokenBucket:
             return ok
 
 
-class MinInterval:
-    """Rejects a key seen again sooner than `app.state.poll_min_interval` seconds."""
-
-    def __init__(self):
-        self.last: dict[str, float] = {}
-        self.lock = threading.Lock()
-
-    def allow(self, key: str, min_interval: float) -> bool:
-        t = monotonic()
-        with self.lock:
-            prev = self.last.get(key)
-            if prev is not None and t - prev < min_interval:
-                return False
-            self.last[key] = t
-            if len(self.last) > 20_000:
-                cutoff = t - LINK_TTL_S
-                self.last = {k: v for k, v in self.last.items() if v > cutoff}
-            return True
-
-
 def client_ip(request: Request) -> str:
     cf = request.headers.get("cf-connecting-ip", "").strip()
     if cf:
@@ -278,17 +326,11 @@ async def read_json(request: Request) -> dict:
     return data
 
 
-def normalize_code(value) -> str | None:
-    if not isinstance(value, str):
-        return None
-    code = re.sub(r"[\s-]", "", value).upper()
-    if len(code) != CODE_LENGTH or any(ch not in CODE_ALPHABET for ch in code):
-        return None
-    return code
-
-
-def format_code(code: str) -> str:
-    return f"{code[:4]}-{code[4:]}"
+def device_name_from(body: dict) -> str:
+    name = body.get("device_name")
+    if not isinstance(name, str) or not name.strip():
+        raise ApiError(400, "device_name is required")
+    return " ".join(name.split())[:MAX_DEVICE_NAME_LEN]
 
 
 def check_number(value, what: str):
@@ -299,10 +341,6 @@ def check_number(value, what: str):
     if not math.isfinite(value) or value < 0 or value > MAX_NUMBER:
         raise ApiError(400, f"{what} out of range")
     return float(value)
-
-
-def ms_or_none(value):
-    return int(value) if value is not None else None
 
 
 # --- app ---------------------------------------------------------------------
@@ -323,12 +361,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="stream-thing-sync", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.db = db
-    app.state.poll_min_interval = POLL_MIN_INTERVAL_S
-    login_limiter = TokenBucket(capacity=10, per_seconds=60)
-    link_start_limiter = TokenBucket(capacity=10, per_seconds=120)
-    approve_limiter = TokenBucket(capacity=20, per_seconds=60)
-    poll_limiter = MinInterval()
-    app.state.limiters = (login_limiter, link_start_limiter, approve_limiter, poll_limiter)
+    login_limiter = TokenBucket(capacity=10, per_seconds=60)     # website sign-in, per IP
+    app_auth_limiter = TokenBucket(capacity=10, per_seconds=60)  # in-app sign-in, per IP
 
     def session_hash(token: str) -> str:
         return hmac.new(session_key, token.encode(), hashlib.sha256).hexdigest()
@@ -358,7 +392,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-store")
         if request.url.path != "/healthz":
-            # Path only: query strings can carry link codes.
+            # Path only, never query strings.
             log.info("%s %s %s %.0fms", request.method, request.url.path, response.status_code,
                      (time.perf_counter() - start) * 1000)
         return response
@@ -407,6 +441,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.headers.get(CSRF_HEADER) != CSRF_VALUE:
             raise ApiError(403, "missing X-Requested-With header")
 
+    async def verify_identity(credential, audience) -> dict:
+        """Verify a Google ID token in a worker thread; map failures to API errors."""
+        from google.auth.exceptions import GoogleAuthError, TransportError
+
+        if not isinstance(credential, str) or not credential or len(credential) > 8192:
+            raise ApiError(400, "a Google ID token is required")
+        try:
+            info = await run_in_threadpool(verify_google_token, credential, audience)
+        except TransportError:
+            log.warning("could not reach Google to verify a sign-in")
+            raise ApiError(502, "could not reach Google, try again")
+        except (ValueError, GoogleAuthError):
+            raise ApiError(401, "invalid Google credential")
+        if not info.get("sub"):
+            raise ApiError(401, "invalid Google credential")
+        return info
+
+    def upsert_user(conn, info: dict) -> int:
+        """Sign-in is sign-up: the first time a Google `sub` is seen, the user is created."""
+        t = now_ms()
+        conn.execute(
+            """INSERT INTO users (google_sub, email, name, picture, created_at, last_login_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, name = excluded.name,
+                   picture = excluded.picture, last_login_at = excluded.last_login_at""",
+            (info["sub"], info.get("email"), info.get("name"), info.get("picture"), t, t),
+        )
+        return conn.execute("SELECT id FROM users WHERE google_sub = ?", (info["sub"],)).fetchone()["id"]
+
+    def sign_in_device(info: dict, device_name: str) -> dict:
+        token = secrets.token_urlsafe(32)
+        t = now_ms()
+        with db.connect() as conn:
+            user_id = upsert_user(conn, info)
+            conn.execute(
+                """INSERT INTO devices (id, user_id, name, token_hash, created_at, last_used_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (secrets.token_hex(8), user_id, device_name, sha256_hex(token), t, t),
+            )
+        log.info("device signed in for user %s", user_id)
+        return {"token": token, "account": {"email": info.get("email"), "name": info.get("name")}}
+
     # --- shared operations ---
 
     def load_credentials(conn, user_id: int) -> dict:
@@ -438,6 +514,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 changes[key] = value or None
             else:
                 raise ApiError(400, f"{key} must be a string or null")
+            if key == "debrid_service" and changes[key] is not None and changes[key] not in DEBRID_SERVICES:
+                raise ApiError(400, f"debrid_service must be one of: {', '.join(DEBRID_SERVICES)}")
         current = load_credentials(conn, user_id)["credentials"]
         for key, value in changes.items():
             if value is None:
@@ -461,12 +539,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- pages ---
 
-    def render_page(mode: str) -> HTMLResponse:
+    def render_page() -> HTMLResponse:
         nonce = secrets.token_urlsafe(16)
-        body = (page_template
-                .replace("{{CLIENT_ID_JSON}}", client_id_json)
-                .replace("{{MODE}}", mode)
-                .replace("{{NONCE}}", nonce))
+        body = page_template.replace("{{CLIENT_ID_JSON}}", client_id_json).replace("{{NONCE}}", nonce)
         csp = "; ".join([
             "default-src 'self'",
             f"script-src 'nonce-{nonce}' https://accounts.google.com/gsi/client",
@@ -487,11 +562,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def index_page():
-        return render_page("home")
-
-    @app.get("/link", include_in_schema=False)
-    async def link_page():
-        return render_page("link")
+        return render_page()
 
     legal_template = (STATIC_DIR / "legal.html").read_text(encoding="utf-8")
     legal_pages = {
@@ -517,72 +588,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def healthz():
         return {"ok": True}
 
-    # --- device link flow ---
+    # --- in-app sign-in (returns a device token) ---
 
-    @app.post("/api/link/start")
-    async def link_start(request: Request):
-        if not link_start_limiter.allow(client_ip(request)):
+    @app.post("/api/auth/google")
+    async def auth_google(request: Request):
+        """Android: Credential Manager gives the app an ID token whose audience is the
+        web client ID; any ID listed in GOOGLE_CLIENT_IDS is accepted too."""
+        if not app_auth_limiter.allow(client_ip(request)):
             raise ApiError(429, "too many requests")
         body = await read_json(request)
-        name = body.get("device_name")
-        if not isinstance(name, str) or not name.strip():
-            raise ApiError(400, "device_name is required")
-        name = " ".join(name.split())[:MAX_DEVICE_NAME_LEN]
-        secret = secrets.token_urlsafe(32)
-        t = now_ms()
-        with db.connect() as conn:
-            conn.execute("DELETE FROM link_requests WHERE expires_at <= ?", (t,))
-            for _ in range(10):
-                code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
-                try:
-                    conn.execute(
-                        """INSERT INTO link_requests (secret_hash, code, device_name, created_at, expires_at)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (sha256_hex(secret), code, name, t, t + LINK_TTL_S * 1000),
-                    )
-                    break
-                except sqlite3.IntegrityError:
-                    continue
-            else:
-                raise ApiError(503, "could not allocate a code, try again")
-        return {
-            "code": format_code(code),
-            "device_secret": secret,
-            "verify_url": f"{settings.public_url}/link",
-            "expires_in": LINK_TTL_S,
-            "interval": LINK_POLL_INTERVAL_S,
-        }
+        name = device_name_from(body)
+        info = await verify_identity(body.get("id_token"), settings.app_audiences)
+        return sign_in_device(info, name)
 
-    @app.post("/api/link/poll")
-    async def link_poll(request: Request):
+    @app.post("/api/auth/google-code")
+    async def auth_google_code(request: Request):
+        """Windows: system-browser loopback flow with PKCE. The app sends the code and
+        verifier; the client secret stays on the server. The ID token Google returns
+        is then verified against the desktop client ID."""
+        if not app_auth_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        if not (settings.desktop_client_id and settings.desktop_client_secret):
+            raise ApiError(503, "desktop sign-in is not configured on this server")
         body = await read_json(request)
-        secret = body.get("device_secret")
-        if not isinstance(secret, str) or not secret or len(secret) > 256:
-            raise ApiError(400, "device_secret is required")
-        secret_hash = sha256_hex(secret)
-        if not poll_limiter.allow(secret_hash, app.state.poll_min_interval):
-            raise ApiError(429, "polling too fast")
-        t = now_ms()
-        with db.connect() as conn:
-            row = conn.execute("SELECT * FROM link_requests WHERE secret_hash = ?", (secret_hash,)).fetchone()
-            if row is None or row["expires_at"] <= t:
-                if row is not None:
-                    conn.execute("DELETE FROM link_requests WHERE secret_hash = ?", (secret_hash,))
-                raise ApiError(410, "expired")
-            if row["user_id"] is None:
-                return {"status": "pending"}
-            # Approved: consume the link record and mint the device token, once.
-            if conn.execute("DELETE FROM link_requests WHERE secret_hash = ?", (secret_hash,)).rowcount != 1:
-                raise ApiError(410, "expired")
-            token = secrets.token_urlsafe(32)
-            conn.execute(
-                """INSERT INTO devices (id, user_id, name, token_hash, created_at, last_used_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (secrets.token_hex(8), row["user_id"], row["device_name"], sha256_hex(token), t, t),
-            )
-            user = conn.execute("SELECT email, name FROM users WHERE id = ?", (row["user_id"],)).fetchone()
-        log.info("device linked for user %s", row["user_id"])
-        return {"status": "approved", "token": token, "account": {"email": user["email"], "name": user["name"]}}
+        name = device_name_from(body)
+        code, verifier, redirect_uri = body.get("code"), body.get("code_verifier"), body.get("redirect_uri")
+        if not isinstance(code, str) or not code or len(code) > 2048:
+            raise ApiError(400, "code is required")
+        if not isinstance(verifier, str) or not 43 <= len(verifier) <= 128:  # RFC 7636
+            raise ApiError(400, "code_verifier must be 43-128 characters")
+        if not valid_loopback_redirect(redirect_uri):
+            raise ApiError(400, "redirect_uri must be http://127.0.0.1:<port>/... or http://localhost:<port>/...")
+        try:
+            tokens = await run_in_threadpool(exchange_google_code, code, verifier, redirect_uri,
+                                             settings.desktop_client_id, settings.desktop_client_secret)
+        except GoogleCodeRejected:
+            raise ApiError(401, "Google rejected the authorization code")
+        except GoogleUnavailable as exc:
+            log.warning("Google code exchange failed: %s", exc)
+            raise ApiError(502, "could not complete sign-in with Google, try again")
+        info = await verify_identity(tokens.get("id_token"), settings.desktop_client_id)
+        return sign_in_device(info, name)
 
     # --- device API ---
 
@@ -694,39 +740,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not login_limiter.allow(client_ip(request)):
             raise ApiError(429, "too many requests")
         body = await read_json(request)
-        credential = body.get("credential")
-        if not isinstance(credential, str) or not credential or len(credential) > 8192:
-            raise ApiError(400, "credential is required")
-        from google.auth.exceptions import GoogleAuthError, TransportError
-
-        try:
-            info = await run_in_threadpool(verify_google_token, credential, settings.google_client_id)
-        except TransportError:
-            log.warning("could not reach Google to verify a sign-in")
-            raise ApiError(502, "could not reach Google, try again")
-        except (ValueError, GoogleAuthError):
-            raise ApiError(401, "invalid Google credential")
-        sub = info.get("sub")
-        if not sub:
-            raise ApiError(401, "invalid Google credential")
-        email, name, picture = info.get("email"), info.get("name"), info.get("picture")
+        info = await verify_identity(body.get("credential"), settings.google_client_id)
         token = secrets.token_urlsafe(32)
         t = now_ms()
         with db.connect() as conn:
-            conn.execute(
-                """INSERT INTO users (google_sub, email, name, picture, created_at, last_login_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, name = excluded.name,
-                       picture = excluded.picture, last_login_at = excluded.last_login_at""",
-                (sub, email, name, picture, t, t),
-            )
-            user_id = conn.execute("SELECT id FROM users WHERE google_sub = ?", (sub,)).fetchone()["id"]
+            user_id = upsert_user(conn, info)
             conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (t,))
             conn.execute(
                 "INSERT INTO sessions (id_hash, user_id, created_at, expires_at, last_used_at) VALUES (?, ?, ?, ?, ?)",
                 (session_hash(token), user_id, t, t + SESSION_TTL_S * 1000, t),
             )
-        response = JSONResponse({"ok": True, "email": email, "name": name})
+        response = JSONResponse({"ok": True, "email": info.get("email"), "name": info.get("name")})
         response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_S, httponly=True,
                             secure=settings.secure_cookies, samesite="lax", path="/")
         return response
@@ -777,50 +801,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise ApiError(404, "no such device")
         return {"ok": True}
 
-    def pending_link(conn, code: str | None):
-        if code is None:
-            raise ApiError(404, "no such code")
-        row = conn.execute("SELECT * FROM link_requests WHERE code = ?", (code,)).fetchone()
-        if row is None or row["user_id"] is not None:
-            raise ApiError(404, "no such code")
-        if row["expires_at"] <= now_ms():
-            raise ApiError(410, "expired")
-        return row
-
-    @app.get("/api/web/link/lookup")
-    async def web_link_lookup(request: Request, code: str = ""):
-        if not approve_limiter.allow(client_ip(request)):
-            raise ApiError(429, "too many requests")
-        with db.connect() as conn:
-            web_auth(conn, request)
-            row = pending_link(conn, normalize_code(code))
-        return {"device_name": row["device_name"], "expires_in": max(0, (row["expires_at"] - now_ms()) // 1000)}
-
-    @app.post("/api/web/link/approve")
-    async def web_link_approve(request: Request):
-        if not approve_limiter.allow(client_ip(request)):
-            raise ApiError(429, "too many requests")
-        with db.connect() as conn:
-            u = web_auth(conn, request)
-        body = await read_json(request)
-        code = body.get("code")
-        if not isinstance(code, str):
-            raise ApiError(400, "code is required")
-        with db.connect() as conn:
-            row = pending_link(conn, normalize_code(code))
-            updated = conn.execute(
-                "UPDATE link_requests SET user_id = ?, approved_at = ? WHERE secret_hash = ? AND user_id IS NULL",
-                (u["id"], now_ms(), row["secret_hash"]),
-            ).rowcount
-            if updated != 1:
-                raise ApiError(404, "no such code")
-        return {"ok": True, "device_name": row["device_name"]}
-
     @app.delete("/api/web/account")
     async def web_delete_account(request: Request):
         with db.connect() as conn:
             u = web_auth(conn, request)
-            # ON DELETE CASCADE removes sessions, devices, links, credentials, progress.
+            # ON DELETE CASCADE removes sessions, devices, credentials and progress.
             conn.execute("DELETE FROM users WHERE id = ?", (u["id"],))
         log.info("account %s deleted", u["id"])
         response = JSONResponse({"ok": True})

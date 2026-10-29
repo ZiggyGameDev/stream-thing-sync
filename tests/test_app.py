@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 import app as appmod
-from conftest import CSRF, bearer, link_device, sign_in
+from conftest import (CSRF, DESKTOP_ID, DESKTOP_SECRET, EXTRA_ID, REDIRECT, VERIFIER, app_sign_in, bearer,
+                      fake_token, link_device, make_settings, sign_in)
 
 
 def db_rows(server, sql, *args):
@@ -21,12 +22,19 @@ def db_rows(server, sql, *args):
 
 def test_healthz_and_pages(client):
     assert client.get("/healthz").json() == {"ok": True}
-    for path in ("/", "/link", "/link?code=ABCD-2345"):
-        r = client.get(path)
-        assert r.status_code == 200
-        assert "test-client.apps.googleusercontent.com" in r.text
-        assert "accounts.google.com/gsi/client" in r.text
-        assert "nonce-" in r.headers["content-security-policy"]
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "web-client.apps.googleusercontent.com" in r.text
+    assert "accounts.google.com/gsi/client" in r.text
+    assert "nonce-" in r.headers["content-security-policy"]
+    assert "inside the stream-thing app" in r.text
+
+
+def test_device_code_flow_is_gone(client):
+    assert client.get("/link").status_code == 404
+    for path in ("/api/link/start", "/api/link/poll", "/api/web/link/approve"):
+        assert client.post(path, json={}).status_code in (404, 405)
+    assert client.get("/api/web/link/lookup?code=ABCD2345").status_code == 404
 
 
 def test_legal_pages(client):
@@ -76,12 +84,11 @@ def test_bad_google_credential_rejected(client):
 
 
 def test_csrf_header_required(client):
-    r = client.post("/api/web/google", json={"credential": "good:alice"})
+    r = client.post("/api/web/google", json={"credential": fake_token("alice")})
     assert r.status_code == 403
     sign_in(client)
     for method, path, body in [
         ("PUT", "/api/web/credentials", {"credentials": {"torbox": "x"}}),
-        ("POST", "/api/web/link/approve", {"code": "ABCD-2345"}),
         ("DELETE", "/api/web/account", None),
         ("POST", "/api/web/logout", None),
     ]:
@@ -103,82 +110,16 @@ def test_web_logout_revokes_session(server, client):
 # --- device link ---------------------------------------------------------------
 
 
-def test_full_device_link_flow(make_client):
-    web, tv = make_client(), make_client()
-    sign_in(web, "alice")
-    start = tv.post("/api/link/start", json={"device_name": "Living room TV"})
-    assert start.status_code == 200
-    s = start.json()
-    assert re.fullmatch(r"[A-HJKMNP-Z2-9]{4}-[A-HJKMNP-Z2-9]{4}", s["code"])
-    assert len(s["device_secret"]) >= 43
-    assert s["verify_url"] == "https://sync.example.test/link"
-    assert s["expires_in"] == 600 and s["interval"] == 5
-
-    assert tv.post("/api/link/poll", json={"device_secret": s["device_secret"]}).json() == {"status": "pending"}
-
-    # Lowercase, dashless entry works; lookup shows the device name.
-    typed = s["code"].replace("-", "").lower()
-    assert web.get(f"/api/web/link/lookup?code={typed}").json()["device_name"] == "Living room TV"
-    r = web.post("/api/web/link/approve", json={"code": typed}, headers=CSRF)
-    assert r.json() == {"ok": True, "device_name": "Living room TV"}
-    # Can't approve twice.
-    assert web.post("/api/web/link/approve", json={"code": s["code"]}, headers=CSRF).status_code == 404
-
-    r = tv.post("/api/link/poll", json={"device_secret": s["device_secret"]})
-    body = r.json()
-    assert body["status"] == "approved"
-    assert body["account"] == {"email": "alice@example.com", "name": "Alice"}
-    token = body["token"]
-    assert len(token) >= 43
-
-    # Consumed: polling again is gone.
-    assert tv.post("/api/link/poll", json={"device_secret": s["device_secret"]}).status_code == 410
-
-    me = tv.get("/api/me", headers=bearer(token)).json()
-    assert me["email"] == "alice@example.com" and me["device"]["name"] == "Living room TV"
-    devices = web.get("/api/web/devices").json()["devices"]
-    assert [d["name"] for d in devices] == ["Living room TV"]
-    assert devices[0]["id"] == me["device"]["id"]
 
 
-def test_link_code_expires(make_client, clock):
-    web, tv = make_client(), make_client()
-    sign_in(web)
-    s = tv.post("/api/link/start", json={"device_name": "TV"}).json()
-    clock.advance(601)
-    assert web.post("/api/web/link/approve", json={"code": s["code"]}, headers=CSRF).status_code in (404, 410)
-    r = tv.post("/api/link/poll", json={"device_secret": s["device_secret"]})
-    assert r.status_code == 410 and r.json() == {"error": "expired"}
 
 
-def test_poll_unknown_secret_and_bad_input(client):
-    assert client.post("/api/link/poll", json={"device_secret": "nope"}).status_code == 410
-    assert client.post("/api/link/poll", json={}).status_code == 400
-    assert client.post("/api/link/start", json={}).status_code == 400
-    assert client.post("/api/link/start", content=b"not json").status_code == 400
 
 
-def test_approve_unknown_code_404(client):
-    sign_in(client)
-    assert client.post("/api/web/link/approve", json={"code": "ABCD-2345"}, headers=CSRF).status_code == 404
-    assert client.post("/api/web/link/approve", json={"code": "!!"}, headers=CSRF).status_code == 404
 
 
-def test_poll_rate_limited(server, client):
-    server.state.poll_min_interval = 2
-    s = client.post("/api/link/start", json={"device_name": "TV"}).json()
-    assert client.post("/api/link/poll", json={"device_secret": s["device_secret"]}).status_code == 200
-    r = client.post("/api/link/poll", json={"device_secret": s["device_secret"]})
-    assert r.status_code == 429 and "error" in r.json()
 
 
-def test_link_start_rate_limited_per_ip(client):
-    codes = [client.post("/api/link/start", json={"device_name": "TV"}, headers={"CF-Connecting-IP": "1.2.3.4"})
-             .status_code for _ in range(12)]
-    assert codes[0] == 200 and codes[-1] == 429
-    # A different client IP is unaffected.
-    assert client.post("/api/link/start", json={"device_name": "TV"},
-                       headers={"CF-Connecting-IP": "5.6.7.8"}).status_code == 200
 
 
 # --- device API ---------------------------------------------------------------
@@ -369,7 +310,7 @@ def test_account_delete(server, make_client):
     assert web.delete("/api/web/account", headers=CSRF).json() == {"ok": True}
     assert d.get("/api/me", headers=bearer(token)).status_code == 401
     assert web.get("/api/web/me").status_code == 401
-    for table in ("users", "sessions", "devices", "credentials", "progress", "link_requests"):
+    for table in ("users", "sessions", "devices", "credentials", "progress"):
         assert db_rows(server, f"SELECT COUNT(*) FROM {table}") == [(0,)], table
 
 
@@ -384,3 +325,182 @@ def test_last_used_updates_at_most_once_a_minute(server, make_client, clock):
     clock.advance(31)
     d.get("/api/me", headers=bearer(token))
     assert db_rows(server, "SELECT last_used_at FROM devices")[0][0] == clock()
+
+
+# --- in-app sign-in: Android (ID token) ---------------------------------------
+
+
+def test_app_google_sign_in_is_sign_up(server, client):
+    r = client.post("/api/auth/google", json={"id_token": fake_token("carol"), "device_name": "  Pixel   8 "})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["account"] == {"email": "carol@example.com", "name": "Carol"}
+    assert len(body["token"]) >= 43
+    me = client.get("/api/me", headers=bearer(body["token"])).json()
+    assert me["email"] == "carol@example.com" and me["device"]["name"] == "Pixel 8"
+    assert db_rows(server, "SELECT google_sub FROM users") == [("carol",)]
+    # Only the hash of the token is stored.
+    assert not db_rows(server, "SELECT 1 FROM devices WHERE token_hash = ?", body["token"])
+    # Signing in again (another device) reuses the user and adds a device.
+    app_sign_in(client, "carol", "Shield TV")
+    assert db_rows(server, "SELECT COUNT(*) FROM users") == [(1,)]
+    assert db_rows(server, "SELECT COUNT(*) FROM devices") == [(2,)]
+
+
+def test_app_and_web_share_the_account(make_client):
+    web, phone = make_client(), make_client()
+    token = app_sign_in(phone, "alice", "Phone")
+    phone.put("/api/credentials", headers=bearer(token), json={"credentials": {"torbox": "tb"}})
+    sign_in(web, "alice")
+    assert web.get("/api/web/credentials").json()["credentials"] == {"torbox": "tb"}
+    assert [d["name"] for d in web.get("/api/web/devices").json()["devices"]] == ["Phone"]
+
+
+def test_app_google_accepts_listed_audiences_only(client):
+    for aud in ("web-client.apps.googleusercontent.com", EXTRA_ID):
+        r = client.post("/api/auth/google", json={"id_token": fake_token("a", aud), "device_name": "x"})
+        assert r.status_code == 200, aud
+    r = client.post("/api/auth/google", json={"id_token": fake_token("a", "someone-else"), "device_name": "x"})
+    assert r.status_code == 401
+    # The website only takes its own client ID.
+    r = client.post("/api/web/google", json={"credential": fake_token("a", EXTRA_ID)}, headers=CSRF)
+    assert r.status_code == 401
+
+
+def test_web_client_id_always_accepted_by_app(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import conftest
+    monkeypatch.setattr(appmod, "verify_google_token", conftest.fake_verify)
+    application = appmod.create_app(make_settings(tmp_path, google_client_ids=()))
+    c = TestClient(application, base_url="https://testserver")
+    assert c.post("/api/auth/google", json={"id_token": fake_token("a"), "device_name": "x"}).status_code == 200
+
+
+def test_app_google_bad_input(client):
+    assert client.post("/api/auth/google", json={"id_token": "forged", "device_name": "x"}).status_code == 401
+    assert client.post("/api/auth/google", json={"id_token": fake_token("a")}).status_code == 400
+    assert client.post("/api/auth/google", json={"id_token": fake_token("a"), "device_name": " "}).status_code == 400
+    assert client.post("/api/auth/google", json={"device_name": "x"}).status_code == 400
+    assert client.post("/api/auth/google", content=b"nope").status_code == 400
+
+
+def test_app_auth_rate_limited_per_ip(client):
+    def go(ip):
+        return client.post("/api/auth/google", json={"id_token": fake_token("a"), "device_name": "x"},
+                           headers={"CF-Connecting-IP": ip}).status_code
+    codes = [go("1.2.3.4") for _ in range(12)]
+    assert codes[0] == 200 and codes[-1] == 429
+    assert go("5.6.7.8") == 200
+    # The desktop endpoint shares the per-IP budget.
+    r = client.post("/api/auth/google-code", headers={"CF-Connecting-IP": "1.2.3.4"},
+                    json={"code": "code:a", "code_verifier": VERIFIER, "redirect_uri": REDIRECT, "device_name": "x"})
+    assert r.status_code == 429
+
+
+# --- in-app sign-in: Windows (authorization code + PKCE) -----------------------
+
+
+def test_app_google_code_flow(server, client, exchange):
+    r = client.post("/api/auth/google-code", json={
+        "code": "code:dave", "code_verifier": VERIFIER, "redirect_uri": REDIRECT, "device_name": "Gaming PC"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["account"] == {"email": "dave@example.com", "name": "Dave"}
+    me = client.get("/api/me", headers=bearer(body["token"])).json()
+    assert me["device"]["name"] == "Gaming PC"
+    # The server, not the app, supplies the desktop client ID and secret.
+    assert exchange.calls == [{"code": "code:dave", "code_verifier": VERIFIER, "redirect_uri": REDIRECT,
+                               "client_id": DESKTOP_ID, "client_secret": DESKTOP_SECRET}]
+
+
+def test_app_google_code_rejections(client, exchange):
+    ips = iter(range(1, 1000))
+
+    def go(**overrides):
+        body = {"code": "code:dave", "code_verifier": VERIFIER, "redirect_uri": REDIRECT, "device_name": "PC"}
+        body.update(overrides)
+        # A fresh client IP per call keeps the per-IP rate limit out of this test.
+        return client.post("/api/auth/google-code", json=body,
+                           headers={"CF-Connecting-IP": f"10.0.0.{next(ips)}"}).status_code
+
+    assert go(code="bad") == 401
+    assert go(code="unreachable") == 502
+    assert go(code="") == 400
+    assert go(code_verifier="short") == 400
+    assert go(code_verifier="v" * 129) == 400
+    assert go(device_name=None) == 400
+    for uri in ("https://127.0.0.1:5000/cb", "http://127.0.0.1/cb", "http://evil.com:5000/cb",
+                "http://127.0.0.1:5000@evil.com/cb", "http://user@127.0.0.1:5000/cb",
+                "http://127.0.0.1.evil.com:5000/cb", "http://[::1]:5000/cb", "http://127.0.0.1:99999/cb",
+                "myapp://callback", "", None):
+        assert go(redirect_uri=uri) == 400, uri
+    for uri in ("http://127.0.0.1:5000/cb", "http://localhost:61234/", "http://localhost:8080"):
+        assert go(redirect_uri=uri) == 200, uri
+    # The returned ID token must be for the desktop client.
+    exchange.id_token_aud = "web-client.apps.googleusercontent.com"
+    assert go() == 401
+    # Only the 6 well-formed requests reached Google; bad input is rejected up front.
+    assert len(exchange.calls) == 6
+
+
+def test_app_google_code_503_without_secret(tmp_path, monkeypatch, exchange):
+    from fastapi.testclient import TestClient
+
+    import conftest
+    monkeypatch.setattr(appmod, "verify_google_token", conftest.fake_verify)
+    application = appmod.create_app(make_settings(tmp_path, desktop_client_secret=""))
+    c = TestClient(application, base_url="https://testserver")
+    r = c.post("/api/auth/google-code", json={
+        "code": "code:dave", "code_verifier": VERIFIER, "redirect_uri": REDIRECT, "device_name": "PC"})
+    assert r.status_code == 503 and "error" in r.json()
+    assert exchange.calls == []
+
+
+def test_settings_from_env(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "web")
+    monkeypatch.setenv("GOOGLE_CLIENT_IDS", " web , extra ,,")
+    monkeypatch.setenv("GOOGLE_DESKTOP_CLIENT_ID", "desk")
+    monkeypatch.delenv("GOOGLE_DESKTOP_CLIENT_SECRET", raising=False)
+    s = appmod.Settings.from_env()
+    assert s.app_audiences == ["web", "extra"]
+    assert s.desktop_client_id == "desk" and s.desktop_client_secret == ""
+
+
+def test_old_link_table_is_dropped(tmp_path):
+    import sqlite3 as sq
+    conn = sq.connect(tmp_path / "sync.db")
+    conn.executescript("CREATE TABLE schema_version (version INTEGER NOT NULL); INSERT INTO schema_version VALUES (1);"
+                       "CREATE TABLE link_requests (secret_hash TEXT PRIMARY KEY);")
+    conn.close()
+    appmod.create_app(make_settings(tmp_path))
+    names = {r[0] for r in db_rows_path(tmp_path, "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "link_requests" not in names and "progress" in names
+    assert db_rows_path(tmp_path, "SELECT version FROM schema_version") == [(2,)]
+
+
+def db_rows_path(path, sql):
+    conn = sqlite3.connect(Path(path) / "sync.db")
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+# --- debrid credentials ----------------------------------------------------------
+
+
+def test_debrid_credentials(make_client):
+    web, d = make_client(), make_client()
+    sign_in(web)
+    h = bearer(link_device(web, d))
+    r = d.put("/api/credentials", headers=h, json={"credentials": {
+        "debrid_service": "realdebrid", "realdebrid": "rd-TOKEN", "torbox": "tb-KEY"}})
+    assert r.status_code == 200
+    assert r.json()["credentials"] == {"debrid_service": "realdebrid", "realdebrid": "rd-TOKEN", "torbox": "tb-KEY"}
+    r = web.put("/api/web/credentials", headers=CSRF, json={"credentials": {"debrid_service": "torbox"}})
+    assert r.json()["credentials"]["debrid_service"] == "torbox"
+    assert d.put("/api/credentials", headers=h,
+                 json={"credentials": {"debrid_service": "alldebrid"}}).status_code == 400
+    r = d.put("/api/credentials", headers=h, json={"credentials": {"debrid_service": None, "realdebrid": ""}})
+    assert r.json()["credentials"] == {"torbox": "tb-KEY"}

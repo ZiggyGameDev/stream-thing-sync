@@ -26,11 +26,10 @@
   .hidden { display: none !important; }
   label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
   .field { display: flex; gap: 8px; }
-  input { flex: 1; min-width: 0; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  input, select { flex: 1; min-width: 0; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
           border-radius: 10px; padding: 10px 12px; font: inherit; }
-  input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
-  input.code { font: 600 22px/1.2 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 0.12em;
-               text-transform: uppercase; text-align: center; }
+  select { width: 100%; appearance: auto; }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
   button { font: inherit; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
            border-radius: 10px; padding: 9px 14px; cursor: pointer; white-space: nowrap; }
   button:hover { border-color: var(--accent); }
@@ -49,8 +48,8 @@
   .devices .name { font-weight: 600; overflow-wrap: anywhere; }
   .msg { min-height: 1.5em; font-size: 14px; margin-top: 10px; }
   .msg.ok { color: var(--ok); } .msg.err { color: var(--danger); }
-  .done { text-align: center; font-size: 18px; padding: 12px 0; }
   .who { font-size: 13px; color: var(--muted); text-align: right; overflow-wrap: anywhere; }
+  .divider { border: 0; border-top: 1px solid var(--line); margin: 18px 0 4px; }
   a { color: var(--accent); }
   footer { margin-top: 24px; font-size: 13px; color: var(--muted); text-align: center; }
   #google-btn { display: flex; justify-content: center; min-height: 44px; margin-top: 8px; }
@@ -66,7 +65,8 @@
   <section id="v-loading" class="card"><p class="muted">Loading…</p></section>
 
   <section id="v-signedout" class="card hidden">
-    <p id="signedout-text">Sign in once and your stream-thing keys and watch progress follow you to every phone, TV and PC.</p>
+    <p>Your stream-thing account: your keys and watch progress follow you to every phone, TV and PC.</p>
+    <p class="small muted">Devices sign in from inside the stream-thing app. Sign in here to manage your keys and devices.</p>
     <div id="google-btn"></div>
     <div class="msg" id="signin-msg"></div>
   </section>
@@ -76,10 +76,21 @@
       <div class="row"><h2>Your API keys</h2><span class="small muted" id="keys-updated"></span></div>
       <p class="small muted">Stored encrypted. Your signed-in devices fetch them automatically.</p>
       <form id="keys-form" autocomplete="off">
+        <label for="debrid-service">Debrid service</label>
+        <select id="debrid-service">
+          <option value="">Not chosen</option>
+          <option value="torbox">TorBox</option>
+          <option value="realdebrid">Real-Debrid</option>
+        </select>
         <div data-key="torbox">
           <label for="k-torbox">TorBox API key <span class="badge" data-badge>not set</span></label>
           <div class="field"><input id="k-torbox" type="password" spellcheck="false"><button type="button" data-toggle>Show</button></div>
         </div>
+        <div data-key="realdebrid">
+          <label for="k-realdebrid">Real-Debrid API token <span class="badge" data-badge>not set</span></label>
+          <div class="field"><input id="k-realdebrid" type="password" spellcheck="false"><button type="button" data-toggle>Show</button></div>
+        </div>
+        <hr class="divider">
         <div data-key="mdblist">
           <label for="k-mdblist">MDBList API key <span class="badge" data-badge>not set</span></label>
           <div class="field"><input id="k-mdblist" type="password" spellcheck="false"><button type="button" data-toggle>Show</button></div>
@@ -94,9 +105,10 @@
     </section>
 
     <section class="card">
-      <div class="row"><h2>Your devices</h2><a href="/link" class="small">Sign in a device</a></div>
+      <h2>Your devices</h2>
       <ul class="devices" id="devices"></ul>
-      <p class="muted small hidden" id="no-devices">No devices yet. Open stream-thing, choose “Sign in”, then enter the code at <a href="/link">/link</a>.</p>
+      <p class="muted small hidden" id="no-devices">No devices yet. Open stream-thing on your phone, TV or PC and sign in with Google there.</p>
+      <p class="muted small" id="devices-hint">To add a device, sign in from inside the stream-thing app.</p>
     </section>
 
     <section class="card">
@@ -109,30 +121,12 @@
     </section>
   </div>
 
-  <div id="v-link" class="hidden">
-    <section class="card" id="link-form-card">
-      <h2>Sign in a device</h2>
-      <p class="muted small">Enter the code shown on your TV, phone or PC.</p>
-      <form id="link-form" autocomplete="off">
-        <input id="code" class="code" maxlength="12" placeholder="XXXX-XXXX" spellcheck="false" autocapitalize="characters" inputmode="text">
-        <p class="small muted hidden" id="device-confirm" style="margin-top:12px"></p>
-        <div class="actions"><button class="primary" type="submit" id="link-btn">Sign in this device</button></div>
-        <div class="msg" id="link-msg"></div>
-      </form>
-    </section>
-    <section class="card hidden" id="link-done">
-      <p class="done">Done — go back to your TV/phone.</p>
-      <p class="small muted" style="text-align:center"><a href="/">Manage your account</a></p>
-    </section>
-  </div>
-
   <footer><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="https://github.com/ZiggyGameDev/stream-thing-sync">Source</a></footer>
 </main>
 
 <script nonce="{{NONCE}}">
 (function () {
   "use strict";
-  var MODE = "{{MODE}}";
   var CLIENT_ID = {{CLIENT_ID_JSON}};
   var $ = function (id) { return document.getElementById(id); };
 
@@ -147,16 +141,16 @@
     });
   }
   function show(id) {
-    ["v-loading", "v-signedout", "v-home", "v-link"].forEach(function (v) { $(v).classList.toggle("hidden", v !== id); });
+    ["v-loading", "v-signedout", "v-home"].forEach(function (v) { $(v).classList.toggle("hidden", v !== id); });
   }
   function msg(id, text, kind) { var el = $(id); el.textContent = text || ""; el.className = "msg" + (kind ? " " + kind : ""); }
   function when(ms) {
     if (!ms) return "never";
-    var d = new Date(ms), diff = (Date.now() - ms) / 1000;
+    var diff = (Date.now() - ms) / 1000;
     if (diff < 90) return "just now";
     if (diff < 3600) return Math.round(diff / 60) + " min ago";
     if (diff < 86400) return Math.round(diff / 3600) + " h ago";
-    return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+    return new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
   }
 
   // --- Google sign-in (Google Identity Services) ---
@@ -172,46 +166,20 @@
       .catch(function (e) { msg("signin-msg", e.message, "err"); });
   }
 
-  // --- home ---
-  var savedKeys = {};
+  // --- keys ---
+  var saved = {};
   function fillKeys(data) {
-    savedKeys = data.credentials || {};
+    saved = data.credentials || {};
+    $("debrid-service").value = saved.debrid_service || "";
     document.querySelectorAll("[data-key]").forEach(function (wrap) {
       var key = wrap.getAttribute("data-key"), input = wrap.querySelector("input"), badge = wrap.querySelector("[data-badge]");
-      var v = savedKeys[key] || "";
+      var v = saved[key] || "";
       input.value = v; input.type = "password"; wrap.querySelector("[data-toggle]").textContent = "Show";
       input.placeholder = v ? "" : "not set";
       badge.textContent = v ? "set · …" + v.slice(-4) : "not set";
       badge.classList.toggle("set", !!v);
     });
     $("keys-updated").textContent = data.updated_at ? "updated " + when(data.updated_at) : "";
-  }
-  function loadDevices() {
-    return api("GET", "/api/web/devices").then(function (data) {
-      var ul = $("devices"); ul.textContent = "";
-      $("no-devices").classList.toggle("hidden", data.devices.length > 0);
-      data.devices.forEach(function (d) {
-        var li = document.createElement("li"), row = document.createElement("div"), info = document.createElement("div");
-        row.className = "row";
-        var name = document.createElement("div"); name.className = "name"; name.textContent = d.name;
-        var meta = document.createElement("div"); meta.className = "small muted";
-        meta.textContent = "Signed in " + when(d.created_at) + " · last used " + when(d.last_used_at);
-        info.appendChild(name); info.appendChild(meta);
-        var b = document.createElement("button"); b.type = "button"; b.className = "danger"; b.textContent = "Sign out";
-        b.addEventListener("click", function () {
-          if (!confirm("Sign out “" + d.name + "”? It will need a new code to sign in again.")) return;
-          b.disabled = true;
-          api("DELETE", "/api/web/devices/" + encodeURIComponent(d.id)).then(loadDevices)
-            .catch(function (e) { b.disabled = false; alert(e.message); });
-        });
-        row.appendChild(info); row.appendChild(b); li.appendChild(row); ul.appendChild(li);
-      });
-    });
-  }
-  function initHome() {
-    show("v-home");
-    api("GET", "/api/web/credentials").then(fillKeys).catch(function (e) { msg("keys-msg", e.message, "err"); });
-    loadDevices().catch(function (e) { msg("account-msg", e.message, "err"); });
   }
   document.querySelectorAll("[data-toggle]").forEach(function (b) {
     b.addEventListener("click", function () {
@@ -222,9 +190,11 @@
   $("keys-form").addEventListener("submit", function (ev) {
     ev.preventDefault();
     var creds = {};
+    var svc = $("debrid-service").value;
+    if (svc !== (saved.debrid_service || "")) creds.debrid_service = svc;
     document.querySelectorAll("[data-key]").forEach(function (wrap) {
       var key = wrap.getAttribute("data-key"), v = wrap.querySelector("input").value.trim();
-      if (v !== (savedKeys[key] || "")) creds[key] = v;
+      if (v !== (saved[key] || "")) creds[key] = v;
     });
     if (!Object.keys(creds).length) { msg("keys-msg", "Nothing changed."); return; }
     msg("keys-msg", "Saving…");
@@ -232,6 +202,34 @@
       .then(function (data) { fillKeys(data); msg("keys-msg", "Saved.", "ok"); })
       .catch(function (e) { msg("keys-msg", e.message, "err"); });
   });
+
+  // --- devices ---
+  function loadDevices() {
+    return api("GET", "/api/web/devices").then(function (data) {
+      var ul = $("devices"); ul.textContent = "";
+      var any = data.devices.length > 0;
+      $("no-devices").classList.toggle("hidden", any);
+      $("devices-hint").classList.toggle("hidden", !any);
+      data.devices.forEach(function (d) {
+        var li = document.createElement("li"), row = document.createElement("div"), info = document.createElement("div");
+        row.className = "row";
+        var name = document.createElement("div"); name.className = "name"; name.textContent = d.name;
+        var meta = document.createElement("div"); meta.className = "small muted";
+        meta.textContent = "Signed in " + when(d.created_at) + " · last used " + when(d.last_used_at);
+        info.appendChild(name); info.appendChild(meta);
+        var b = document.createElement("button"); b.type = "button"; b.className = "danger"; b.textContent = "Sign out";
+        b.addEventListener("click", function () {
+          if (!confirm("Sign out “" + d.name + "”? You can sign in again from the app.")) return;
+          b.disabled = true;
+          api("DELETE", "/api/web/devices/" + encodeURIComponent(d.id)).then(loadDevices)
+            .catch(function (e) { b.disabled = false; alert(e.message); });
+        });
+        row.appendChild(info); row.appendChild(b); li.appendChild(row); ul.appendChild(li);
+      });
+    });
+  }
+
+  // --- account ---
   $("logout").addEventListener("click", function () {
     api("POST", "/api/web/logout").then(function () { location.href = "/"; });
   });
@@ -241,54 +239,17 @@
       .catch(function (e) { msg("account-msg", e.message, "err"); });
   });
 
-  // --- link ---
-  var lookupTimer = null;
-  function normCode(v) { return v.toUpperCase().replace(/[\s-]/g, ""); }
-  function onCodeInput() {
-    var c = normCode($("code").value), conf = $("device-confirm");
-    clearTimeout(lookupTimer); msg("link-msg", "");
-    conf.classList.add("hidden");
-    if (c.length !== 8) return;
-    lookupTimer = setTimeout(function () {
-      api("GET", "/api/web/link/lookup?code=" + encodeURIComponent(c)).then(function (d) {
-        conf.textContent = "Device: " + d.device_name; conf.classList.remove("hidden");
-      }).catch(function (e) {
-        msg("link-msg", e.status === 404 ? "No device is waiting with that code. Check it and try again." :
-                        e.status === 410 ? "That code has expired. Get a new one on your device." : e.message, "err");
-      });
-    }, 250);
-  }
-  function initLink() {
-    show("v-link");
-    var q = new URLSearchParams(location.search).get("code");
-    if (q) { $("code").value = q.toUpperCase(); onCodeInput(); }
-    $("code").focus();
-  }
-  $("code").addEventListener("input", onCodeInput);
-  $("link-form").addEventListener("submit", function (ev) {
-    ev.preventDefault();
-    var c = normCode($("code").value);
-    if (c.length !== 8) { msg("link-msg", "Codes are 8 characters, like ABCD-2345.", "err"); return; }
-    $("link-btn").disabled = true; msg("link-msg", "Signing in…");
-    api("POST", "/api/web/link/approve", { code: c }).then(function () {
-      $("link-form-card").classList.add("hidden"); $("link-done").classList.remove("hidden");
-    }).catch(function (e) {
-      $("link-btn").disabled = false;
-      msg("link-msg", e.status === 404 ? "No device is waiting with that code. Check it and try again." :
-                      e.status === 410 ? "That code has expired. Get a new one on your device." : e.message, "err");
-    });
-  });
-
   // --- boot ---
   function start() {
     api("GET", "/api/web/me").then(function (me) {
       $("who").textContent = me.email || me.name || "";
-      if (MODE === "link") initLink(); else initHome();
+      show("v-home");
+      api("GET", "/api/web/credentials").then(fillKeys).catch(function (e) { msg("keys-msg", e.message, "err"); });
+      loadDevices().catch(function (e) { msg("account-msg", e.message, "err"); });
     }).catch(function (e) {
-      if (e.status !== 401) { show("v-signedout"); msg("signin-msg", e.message, "err"); }
       $("who").textContent = "";
-      if (MODE === "link") $("signedout-text").textContent = "Sign in with Google first, then enter the code from your device.";
       show("v-signedout");
+      if (e.status !== 401) msg("signin-msg", e.message, "err");
       renderGoogle();
     });
   }
