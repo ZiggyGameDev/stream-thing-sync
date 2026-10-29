@@ -1,0 +1,834 @@
+"""stream-thing-sync: accounts, encrypted API keys and watch progress for stream-thing.
+
+One file on purpose: a FastAPI app over a single SQLite database. See README.md
+for the API contract. Secrets (SECRET_KEY) come from the environment only.
+
+Nothing secret is ever logged: not device tokens, session ids, link codes,
+device secrets, Google ID tokens or API keys. uvicorn's access log is turned off
+(it would print `/link?code=...`); the middleware below logs paths without
+query strings instead.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import math
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+log = logging.getLogger("stream_thing_sync")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+
+# --- constants ---------------------------------------------------------------
+
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/1/I/L
+CODE_LENGTH = 8
+LINK_TTL_S = 600
+LINK_POLL_INTERVAL_S = 5
+POLL_MIN_INTERVAL_S = 1.8  # "about one per 2s", with a little jitter tolerance
+SESSION_COOKIE = "sts_session"
+SESSION_TTL_S = 60 * 24 * 3600
+CSRF_HEADER = "x-requested-with"
+CSRF_VALUE = "sync"
+CREDENTIAL_KEYS = ("torbox", "mdblist", "poster")
+MAX_CREDENTIAL_LEN = 512
+MAX_PROGRESS_ENTRIES = 500
+MAX_DEVICE_NAME_LEN = 80
+MAX_BODY_BYTES = 1_000_000
+MAX_NUMBER = 1e10
+LAST_USED_RESOLUTION_MS = 60_000
+VIDEO_ID_RE = re.compile(r"^[\x21-\x7e]{1,200}$")  # printable ASCII, no spaces
+SCHEMA_VERSION = 1
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def now_ms() -> int:
+    """Wall clock in ms. Module-level so tests can monkeypatch it."""
+    return int(time.time() * 1000)
+
+
+def monotonic() -> float:
+    return time.monotonic()
+
+
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def verify_google_token(credential: str, client_id: str) -> dict:
+    """Verify a Google Identity Services ID token. Tests monkeypatch this."""
+    from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token
+
+    return id_token.verify_oauth2_token(credential, google_requests.Request(), client_id)
+
+
+# --- settings ----------------------------------------------------------------
+
+
+@dataclass
+class Settings:
+    google_client_id: str
+    secret_key: str
+    public_url: str
+    data_dir: str
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        missing = [k for k in ("GOOGLE_CLIENT_ID", "SECRET_KEY") if not os.environ.get(k, "").strip()]
+        if missing:
+            raise RuntimeError(f"missing required environment variable(s): {', '.join(missing)} (see .env.example)")
+        return cls(
+            google_client_id=os.environ["GOOGLE_CLIENT_ID"].strip(),
+            secret_key=os.environ["SECRET_KEY"].strip(),
+            public_url=os.environ.get("PUBLIC_URL", "https://sync.thestoreisclosed.co.uk").strip().rstrip("/"),
+            data_dir=os.environ.get("DATA_DIR", "/data").strip(),
+        )
+
+    @property
+    def secure_cookies(self) -> bool:
+        return self.public_url.startswith("https://")
+
+
+# --- errors ------------------------------------------------------------------
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, error: str):
+        super().__init__(error)
+        self.status = status
+        self.error = error
+
+
+# --- database ----------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY,
+    google_sub    TEXT NOT NULL UNIQUE,
+    email         TEXT,
+    name          TEXT,
+    picture       TEXT,
+    created_at    INTEGER NOT NULL,
+    last_login_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id_hash      TEXT PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS devices (
+    id           TEXT PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS devices_user ON devices(user_id);
+CREATE TABLE IF NOT EXISTS link_requests (
+    secret_hash TEXT PRIMARY KEY,
+    code        TEXT NOT NULL UNIQUE,
+    device_name TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    approved_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS credentials (
+    user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    blob       BLOB NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS progress (
+    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    video_id          TEXT NOT NULL,
+    position          REAL,
+    duration          REAL,
+    watched           INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS progress_since ON progress(user_id, changed_at);
+"""
+
+
+class Database:
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as c:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.executescript(SCHEMA)
+            row = c.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            current = row[0] or 0
+            # Future migrations go here: `if current < 2: ...`.
+            if current < SCHEMA_VERSION:
+                c.execute("DELETE FROM schema_version")
+                c.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(self.path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+# --- rate limiting -----------------------------------------------------------
+
+
+class TokenBucket:
+    """Per-key token bucket: `capacity` burst, refilled at capacity/per_seconds."""
+
+    def __init__(self, capacity: float, per_seconds: float):
+        self.capacity = capacity
+        self.rate = capacity / per_seconds
+        self.buckets: dict[str, tuple[float, float]] = {}
+        self.lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        t = monotonic()
+        with self.lock:
+            tokens, last = self.buckets.get(key, (self.capacity, t))
+            tokens = min(self.capacity, tokens + (t - last) * self.rate)
+            ok = tokens >= 1
+            self.buckets[key] = (tokens - 1 if ok else tokens, t)
+            if len(self.buckets) > 20_000:
+                full = [k for k, (tk, lt) in self.buckets.items() if tk + (t - lt) * self.rate >= self.capacity]
+                for k in full:
+                    del self.buckets[k]
+            return ok
+
+
+class MinInterval:
+    """Rejects a key seen again sooner than `app.state.poll_min_interval` seconds."""
+
+    def __init__(self):
+        self.last: dict[str, float] = {}
+        self.lock = threading.Lock()
+
+    def allow(self, key: str, min_interval: float) -> bool:
+        t = monotonic()
+        with self.lock:
+            prev = self.last.get(key)
+            if prev is not None and t - prev < min_interval:
+                return False
+            self.last[key] = t
+            if len(self.last) > 20_000:
+                cutoff = t - LINK_TTL_S
+                self.last = {k: v for k, v in self.last.items() if v > cutoff}
+            return True
+
+
+def client_ip(request: Request) -> str:
+    cf = request.headers.get("cf-connecting-ip", "").strip()
+    if cf:
+        return cf
+    return request.client.host if request.client else "unknown"
+
+
+# --- helpers -----------------------------------------------------------------
+
+
+async def read_json(request: Request) -> dict:
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        raise ApiError(413, "request too large")
+    if not raw:
+        raise ApiError(400, "expected a JSON object body")
+    try:
+        data = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        raise ApiError(400, "invalid JSON")
+    if not isinstance(data, dict):
+        raise ApiError(400, "expected a JSON object body")
+    return data
+
+
+def normalize_code(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    code = re.sub(r"[\s-]", "", value).upper()
+    if len(code) != CODE_LENGTH or any(ch not in CODE_ALPHABET for ch in code):
+        return None
+    return code
+
+
+def format_code(code: str) -> str:
+    return f"{code[:4]}-{code[4:]}"
+
+
+def check_number(value, what: str):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ApiError(400, f"{what} must be a number or null")
+    if not math.isfinite(value) or value < 0 or value > MAX_NUMBER:
+        raise ApiError(400, f"{what} out of range")
+    return float(value)
+
+
+def ms_or_none(value):
+    return int(value) if value is not None else None
+
+
+# --- app ---------------------------------------------------------------------
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    try:
+        fernet = Fernet(settings.secret_key.encode())
+    except (ValueError, TypeError):
+        raise RuntimeError("SECRET_KEY must be a urlsafe base64 32-byte Fernet key (see .env.example)")
+    session_key = hashlib.sha256(b"stream-thing-sync/session/" + settings.secret_key.encode()).digest()
+    db = Database(Path(settings.data_dir) / "sync.db")
+    page_template = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    # A JS string literal that can't close the <script> element.
+    client_id_json = json.dumps(settings.google_client_id).replace("<", "\\u003c").replace(">", "\\u003e")
+
+    app = FastAPI(title="stream-thing-sync", docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.settings = settings
+    app.state.db = db
+    app.state.poll_min_interval = POLL_MIN_INTERVAL_S
+    login_limiter = TokenBucket(capacity=10, per_seconds=60)
+    link_start_limiter = TokenBucket(capacity=10, per_seconds=120)
+    approve_limiter = TokenBucket(capacity=20, per_seconds=60)
+    poll_limiter = MinInterval()
+    app.state.limiters = (login_limiter, link_start_limiter, approve_limiter, poll_limiter)
+
+    def session_hash(token: str) -> str:
+        return hmac.new(session_key, token.encode(), hashlib.sha256).hexdigest()
+
+    # --- error handling / middleware ---
+
+    @app.exception_handler(ApiError)
+    async def _api_error(request: Request, exc: ApiError):
+        return JSONResponse({"error": exc.error}, status_code=exc.status)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException):
+        message = {404: "not found", 405: "method not allowed"}.get(exc.status_code, str(exc.detail))
+        return JSONResponse({"error": message}, status_code=exc.status_code)
+
+    @app.exception_handler(Exception)
+    async def _unexpected(request: Request, exc: Exception):
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse({"error": "internal error"}, status_code=500)
+
+    @app.middleware("http")
+    async def _headers_and_log(request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        if request.url.path != "/healthz":
+            # Path only: query strings can carry link codes.
+            log.info("%s %s %s %.0fms", request.method, request.url.path, response.status_code,
+                     (time.perf_counter() - start) * 1000)
+        return response
+
+    # --- auth ---
+
+    def device_auth(conn: sqlite3.Connection, request: Request) -> sqlite3.Row:
+        header = request.headers.get("authorization", "")
+        scheme, _, token = header.partition(" ")
+        token = token.strip()
+        if scheme.lower() != "bearer" or not token:
+            raise ApiError(401, "missing or invalid token")
+        row = conn.execute(
+            """SELECT d.id AS device_id, d.name AS device_name, d.last_used_at AS device_last_used,
+                      u.id AS user_id, u.email, u.name
+               FROM devices d JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?""",
+            (sha256_hex(token),),
+        ).fetchone()
+        if row is None:
+            raise ApiError(401, "missing or invalid token")
+        t = now_ms()
+        if t - row["device_last_used"] >= LAST_USED_RESOLUTION_MS:
+            conn.execute("UPDATE devices SET last_used_at = ? WHERE id = ?", (t, row["device_id"]))
+        return row
+
+    def web_auth(conn: sqlite3.Connection, request: Request) -> sqlite3.Row:
+        if request.method not in ("GET", "HEAD") and request.headers.get(CSRF_HEADER) != CSRF_VALUE:
+            raise ApiError(403, "missing X-Requested-With header")
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token:
+            raise ApiError(401, "not signed in")
+        t = now_ms()
+        row = conn.execute(
+            """SELECT s.id_hash, s.last_used_at AS session_last_used, u.*
+               FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.id_hash = ? AND s.expires_at > ?""",
+            (session_hash(token), t),
+        ).fetchone()
+        if row is None:
+            raise ApiError(401, "not signed in")
+        if t - row["session_last_used"] >= LAST_USED_RESOLUTION_MS:
+            conn.execute("UPDATE sessions SET last_used_at = ? WHERE id_hash = ?", (t, row["id_hash"]))
+        return row
+
+    def require_csrf(request: Request):
+        if request.headers.get(CSRF_HEADER) != CSRF_VALUE:
+            raise ApiError(403, "missing X-Requested-With header")
+
+    # --- shared operations ---
+
+    def load_credentials(conn, user_id: int) -> dict:
+        row = conn.execute("SELECT blob, updated_at FROM credentials WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return {"credentials": {}, "updated_at": None}
+        try:
+            creds = json.loads(fernet.decrypt(bytes(row["blob"])))
+        except InvalidToken:
+            log.error("credentials for user %s could not be decrypted (SECRET_KEY changed?)", user_id)
+            raise ApiError(500, "stored credentials could not be decrypted")
+        return {"credentials": {k: v for k, v in creds.items() if k in CREDENTIAL_KEYS and v},
+                "updated_at": int(row["updated_at"])}
+
+    def put_credentials(conn, user_id: int, body: dict) -> dict:
+        incoming = body.get("credentials")
+        if not isinstance(incoming, dict):
+            raise ApiError(400, "expected {\"credentials\": {...}}")
+        changes: dict[str, str | None] = {}
+        for key, value in incoming.items():
+            if key not in CREDENTIAL_KEYS:
+                raise ApiError(400, f"unknown credential key (allowed: {', '.join(CREDENTIAL_KEYS)})")
+            if value is None or value == "":
+                changes[key] = None
+            elif isinstance(value, str):
+                value = value.strip()
+                if len(value) > MAX_CREDENTIAL_LEN:
+                    raise ApiError(400, f"{key} is longer than {MAX_CREDENTIAL_LEN} characters")
+                changes[key] = value or None
+            else:
+                raise ApiError(400, f"{key} must be a string or null")
+        current = load_credentials(conn, user_id)["credentials"]
+        for key, value in changes.items():
+            if value is None:
+                current.pop(key, None)
+            else:
+                current[key] = value
+        blob = fernet.encrypt(json.dumps(current).encode())
+        conn.execute(
+            """INSERT INTO credentials (user_id, blob, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at""",
+            (user_id, blob, now_ms()),
+        )
+        return load_credentials(conn, user_id)
+
+    def list_devices(conn, user_id: int) -> list[dict]:
+        rows = conn.execute(
+            "SELECT id, name, created_at, last_used_at FROM devices WHERE user_id = ? ORDER BY last_used_at DESC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- pages ---
+
+    def render_page(mode: str) -> HTMLResponse:
+        nonce = secrets.token_urlsafe(16)
+        body = (page_template
+                .replace("{{CLIENT_ID_JSON}}", client_id_json)
+                .replace("{{MODE}}", mode)
+                .replace("{{NONCE}}", nonce))
+        csp = "; ".join([
+            "default-src 'self'",
+            f"script-src 'nonce-{nonce}' https://accounts.google.com/gsi/client",
+            "style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style",
+            "frame-src https://accounts.google.com/gsi/",
+            "connect-src 'self' https://accounts.google.com/gsi/",
+            "img-src 'self' data: https://*.googleusercontent.com",
+            "base-uri 'none'",
+            "form-action 'self'",
+            "frame-ancestors 'none'",
+        ])
+        return HTMLResponse(body, headers={
+            "Content-Security-Policy": csp,
+            # GIS popup mode needs to talk back to this window.
+            "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+            "Cache-Control": "no-store",
+        })
+
+    @app.get("/", include_in_schema=False)
+    async def index_page():
+        return render_page("home")
+
+    @app.get("/link", include_in_schema=False)
+    async def link_page():
+        return render_page("link")
+
+    legal_template = (STATIC_DIR / "legal.html").read_text(encoding="utf-8")
+    legal_pages = {
+        name: legal_template.replace("{{TITLE}}", title)
+                            .replace("{{BODY}}", (STATIC_DIR / f"{name}.html").read_text(encoding="utf-8"))
+        for name, title in (("privacy", "Privacy"), ("terms", "Terms"))
+    }
+    legal_headers = {
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+                                   "form-action 'none'; frame-ancestors 'none'",
+        "Cache-Control": "public, max-age=3600",
+    }
+
+    @app.get("/privacy", include_in_schema=False)
+    async def privacy_page():
+        return HTMLResponse(legal_pages["privacy"], headers=legal_headers)
+
+    @app.get("/terms", include_in_schema=False)
+    async def terms_page():
+        return HTMLResponse(legal_pages["terms"], headers=legal_headers)
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"ok": True}
+
+    # --- device link flow ---
+
+    @app.post("/api/link/start")
+    async def link_start(request: Request):
+        if not link_start_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        body = await read_json(request)
+        name = body.get("device_name")
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError(400, "device_name is required")
+        name = " ".join(name.split())[:MAX_DEVICE_NAME_LEN]
+        secret = secrets.token_urlsafe(32)
+        t = now_ms()
+        with db.connect() as conn:
+            conn.execute("DELETE FROM link_requests WHERE expires_at <= ?", (t,))
+            for _ in range(10):
+                code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+                try:
+                    conn.execute(
+                        """INSERT INTO link_requests (secret_hash, code, device_name, created_at, expires_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (sha256_hex(secret), code, name, t, t + LINK_TTL_S * 1000),
+                    )
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+            else:
+                raise ApiError(503, "could not allocate a code, try again")
+        return {
+            "code": format_code(code),
+            "device_secret": secret,
+            "verify_url": f"{settings.public_url}/link",
+            "expires_in": LINK_TTL_S,
+            "interval": LINK_POLL_INTERVAL_S,
+        }
+
+    @app.post("/api/link/poll")
+    async def link_poll(request: Request):
+        body = await read_json(request)
+        secret = body.get("device_secret")
+        if not isinstance(secret, str) or not secret or len(secret) > 256:
+            raise ApiError(400, "device_secret is required")
+        secret_hash = sha256_hex(secret)
+        if not poll_limiter.allow(secret_hash, app.state.poll_min_interval):
+            raise ApiError(429, "polling too fast")
+        t = now_ms()
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM link_requests WHERE secret_hash = ?", (secret_hash,)).fetchone()
+            if row is None or row["expires_at"] <= t:
+                if row is not None:
+                    conn.execute("DELETE FROM link_requests WHERE secret_hash = ?", (secret_hash,))
+                raise ApiError(410, "expired")
+            if row["user_id"] is None:
+                return {"status": "pending"}
+            # Approved: consume the link record and mint the device token, once.
+            if conn.execute("DELETE FROM link_requests WHERE secret_hash = ?", (secret_hash,)).rowcount != 1:
+                raise ApiError(410, "expired")
+            token = secrets.token_urlsafe(32)
+            conn.execute(
+                """INSERT INTO devices (id, user_id, name, token_hash, created_at, last_used_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (secrets.token_hex(8), row["user_id"], row["device_name"], sha256_hex(token), t, t),
+            )
+            user = conn.execute("SELECT email, name FROM users WHERE id = ?", (row["user_id"],)).fetchone()
+        log.info("device linked for user %s", row["user_id"])
+        return {"status": "approved", "token": token, "account": {"email": user["email"], "name": user["name"]}}
+
+    # --- device API ---
+
+    @app.get("/api/me")
+    async def me(request: Request):
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+        return {"email": d["email"], "name": d["name"], "device": {"id": d["device_id"], "name": d["device_name"]}}
+
+    @app.get("/api/credentials")
+    async def device_get_credentials(request: Request):
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            return load_credentials(conn, d["user_id"])
+
+    @app.put("/api/credentials")
+    async def device_put_credentials(request: Request):
+        body = await read_json(request)
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            return put_credentials(conn, d["user_id"], body)
+
+    def sync_watermark() -> int:
+        # The `now` handed to clients as their next `since`. One ms behind the
+        # clock: a write later in this same millisecond gets changed_at == now_ms(),
+        # which `changed_at > since` would otherwise skip. Rows from the previous
+        # millisecond may be sent twice, which newest-wins merging makes harmless.
+        return now_ms() - 1
+
+    @app.get("/api/progress")
+    async def get_progress(request: Request, since: str = "0"):
+        try:
+            since_ms = int(since)
+        except ValueError:
+            raise ApiError(400, "since must be an integer (ms epoch)")
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            watermark = sync_watermark()
+            # `since` is the `now` this server handed out earlier, so it is compared
+            # with changed_at (the server's clock when the row was last written), never
+            # with the device-supplied updatedAt: a device whose clock runs behind
+            # must not be able to hide its updates from the others.
+            rows = conn.execute(
+                """SELECT video_id, position, duration, watched, updated_at FROM progress
+                   WHERE user_id = ? AND changed_at > ?""",
+                (d["user_id"], since_ms),
+            ).fetchall()
+        return {
+            "progress": {
+                r["video_id"]: {"position": r["position"], "duration": r["duration"],
+                                "watched": bool(r["watched"]), "updatedAt": int(r["updated_at"])}
+                for r in rows
+            },
+            "now": watermark,
+        }
+
+    @app.post("/api/progress")
+    async def post_progress(request: Request):
+        body = await read_json(request)
+        entries = body.get("progress")
+        if not isinstance(entries, dict):
+            raise ApiError(400, "expected {\"progress\": {...}}")
+        if len(entries) > MAX_PROGRESS_ENTRIES:
+            raise ApiError(400, f"at most {MAX_PROGRESS_ENTRIES} entries per request")
+        t = now_ms()
+        rows = []
+        for video_id, entry in entries.items():
+            if not VIDEO_ID_RE.match(video_id):
+                raise ApiError(400, "invalid videoId")
+            if not isinstance(entry, dict):
+                raise ApiError(400, f"entry for {video_id} must be an object")
+            position = check_number(entry.get("position"), "position")
+            duration = check_number(entry.get("duration"), "duration")
+            watched = entry.get("watched", False)
+            if not isinstance(watched, bool):
+                raise ApiError(400, "watched must be a boolean")
+            updated = entry.get("updatedAt")
+            if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not math.isfinite(updated) \
+                    or updated <= 0:
+                raise ApiError(400, "updatedAt must be a positive ms epoch")
+            # A device clock running ahead must not win forever: clamp to server time.
+            updated = min(int(updated), t)
+            rows.append((video_id, position, duration, int(watched), updated, t))
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            conn.executemany(
+                """INSERT INTO progress (user_id, video_id, position, duration, watched, updated_at, changed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, video_id) DO UPDATE SET
+                       position = excluded.position, duration = excluded.duration, watched = excluded.watched,
+                       updated_at = excluded.updated_at, changed_at = excluded.changed_at
+                   WHERE excluded.updated_at >= progress.updated_at""",
+                [(d["user_id"],) + r for r in rows],
+            )
+        return {"ok": True, "now": sync_watermark()}
+
+    @app.post("/api/logout")
+    async def device_logout(request: Request):
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            conn.execute("DELETE FROM devices WHERE id = ?", (d["device_id"],))
+        return {"ok": True}
+
+    # --- website API (cookie session) ---
+
+    @app.post("/api/web/google")
+    async def web_google(request: Request):
+        require_csrf(request)
+        if not login_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        body = await read_json(request)
+        credential = body.get("credential")
+        if not isinstance(credential, str) or not credential or len(credential) > 8192:
+            raise ApiError(400, "credential is required")
+        from google.auth.exceptions import GoogleAuthError, TransportError
+
+        try:
+            info = await run_in_threadpool(verify_google_token, credential, settings.google_client_id)
+        except TransportError:
+            log.warning("could not reach Google to verify a sign-in")
+            raise ApiError(502, "could not reach Google, try again")
+        except (ValueError, GoogleAuthError):
+            raise ApiError(401, "invalid Google credential")
+        sub = info.get("sub")
+        if not sub:
+            raise ApiError(401, "invalid Google credential")
+        email, name, picture = info.get("email"), info.get("name"), info.get("picture")
+        token = secrets.token_urlsafe(32)
+        t = now_ms()
+        with db.connect() as conn:
+            conn.execute(
+                """INSERT INTO users (google_sub, email, name, picture, created_at, last_login_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, name = excluded.name,
+                       picture = excluded.picture, last_login_at = excluded.last_login_at""",
+                (sub, email, name, picture, t, t),
+            )
+            user_id = conn.execute("SELECT id FROM users WHERE google_sub = ?", (sub,)).fetchone()["id"]
+            conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (t,))
+            conn.execute(
+                "INSERT INTO sessions (id_hash, user_id, created_at, expires_at, last_used_at) VALUES (?, ?, ?, ?, ?)",
+                (session_hash(token), user_id, t, t + SESSION_TTL_S * 1000, t),
+            )
+        response = JSONResponse({"ok": True, "email": email, "name": name})
+        response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_S, httponly=True,
+                            secure=settings.secure_cookies, samesite="lax", path="/")
+        return response
+
+    @app.get("/api/web/me")
+    async def web_me(request: Request):
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+        return {"email": u["email"], "name": u["name"], "picture": u["picture"]}
+
+    @app.post("/api/web/logout")
+    async def web_logout(request: Request):
+        require_csrf(request)
+        token = request.cookies.get(SESSION_COOKIE)
+        if token:
+            with db.connect() as conn:
+                conn.execute("DELETE FROM sessions WHERE id_hash = ?", (session_hash(token),))
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(SESSION_COOKIE, path="/", secure=settings.secure_cookies, httponly=True,
+                               samesite="lax")
+        return response
+
+    @app.get("/api/web/credentials")
+    async def web_get_credentials(request: Request):
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+            return load_credentials(conn, u["id"])
+
+    @app.put("/api/web/credentials")
+    async def web_put_credentials(request: Request):
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+        body = await read_json(request)
+        with db.connect() as conn:
+            return put_credentials(conn, u["id"], body)
+
+    @app.get("/api/web/devices")
+    async def web_devices(request: Request):
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+            return {"devices": list_devices(conn, u["id"])}
+
+    @app.delete("/api/web/devices/{device_id}")
+    async def web_delete_device(device_id: str, request: Request):
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+            if conn.execute("DELETE FROM devices WHERE id = ? AND user_id = ?", (device_id, u["id"])).rowcount != 1:
+                raise ApiError(404, "no such device")
+        return {"ok": True}
+
+    def pending_link(conn, code: str | None):
+        if code is None:
+            raise ApiError(404, "no such code")
+        row = conn.execute("SELECT * FROM link_requests WHERE code = ?", (code,)).fetchone()
+        if row is None or row["user_id"] is not None:
+            raise ApiError(404, "no such code")
+        if row["expires_at"] <= now_ms():
+            raise ApiError(410, "expired")
+        return row
+
+    @app.get("/api/web/link/lookup")
+    async def web_link_lookup(request: Request, code: str = ""):
+        if not approve_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        with db.connect() as conn:
+            web_auth(conn, request)
+            row = pending_link(conn, normalize_code(code))
+        return {"device_name": row["device_name"], "expires_in": max(0, (row["expires_at"] - now_ms()) // 1000)}
+
+    @app.post("/api/web/link/approve")
+    async def web_link_approve(request: Request):
+        if not approve_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+        body = await read_json(request)
+        code = body.get("code")
+        if not isinstance(code, str):
+            raise ApiError(400, "code is required")
+        with db.connect() as conn:
+            row = pending_link(conn, normalize_code(code))
+            updated = conn.execute(
+                "UPDATE link_requests SET user_id = ?, approved_at = ? WHERE secret_hash = ? AND user_id IS NULL",
+                (u["id"], now_ms(), row["secret_hash"]),
+            ).rowcount
+            if updated != 1:
+                raise ApiError(404, "no such code")
+        return {"ok": True, "device_name": row["device_name"]}
+
+    @app.delete("/api/web/account")
+    async def web_delete_account(request: Request):
+        with db.connect() as conn:
+            u = web_auth(conn, request)
+            # ON DELETE CASCADE removes sessions, devices, links, credentials, progress.
+            conn.execute("DELETE FROM users WHERE id = ?", (u["id"],))
+        log.info("account %s deleted", u["id"])
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(SESSION_COOKIE, path="/", secure=settings.secure_cookies, httponly=True,
+                               samesite="lax")
+        return response
+
+    return app
+
+
+app = create_app()

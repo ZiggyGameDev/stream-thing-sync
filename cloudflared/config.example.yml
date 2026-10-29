@@ -1,0 +1,11 @@
+# Example only - the real file lives on cctv at
+# /home/ziggy/.cloudflared/streamsync/config.yml next to the tunnel's
+# credentials JSON, and is mounted read-only into the cloudflared container at
+# /etc/cloudflared. Paths below are as seen inside the container.
+tunnel: <TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: sync.thestoreisclosed.co.uk
+    service: http://server:8095
+  - service: http_status:404

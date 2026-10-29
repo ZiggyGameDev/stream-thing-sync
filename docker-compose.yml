@@ -1,0 +1,56 @@
+# stream-thing-sync: accounts, encrypted API keys and watch progress for the
+# stream-thing app. Runs beside cctv and buildbox on the same Debian box in its
+# own compose project with its own Cloudflare tunnel. One SQLite file, no other
+# services.
+services:
+  server:
+    build: .
+    restart: unless-stopped
+    # uvicorn as PID 1 never reaps orphans; tini does.
+    init: true
+    env_file: .env
+    environment:
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID in .env}
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      PUBLIC_URL: ${PUBLIC_URL:-https://sync.thestoreisclosed.co.uk}
+      DATA_DIR: /data
+      TZ: ${TZ:-Europe/London}
+    ports:
+      # Loopback only, for `curl 127.0.0.1:8095/healthz` on the box. The public
+      # path is the tunnel, which reaches server:8095 over the compose network.
+      - "127.0.0.1:8095:8095"
+    volumes:
+      - ${SYNC_DATA_DIR:-/mnt/data/stream-thing-sync}:/data
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+
+  # CLI-managed tunnel: `cloudflared tunnel create/route dns` on the host made
+  # the credentials file; config.yml sits next to it (see README and
+  # cloudflared/config.example.yml).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - ${CF_CONFIG_DIR:-/home/ziggy/.cloudflared/streamsync}:/etc/cloudflared:ro
+    depends_on: [server]
+    read_only: true
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
