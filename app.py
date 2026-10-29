@@ -28,7 +28,7 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -57,6 +57,14 @@ VIDEO_ID_RE = re.compile(r"^[\x21-\x7e]{1,200}$")  # printable ASCII, no spaces
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCHEMA_VERSION = 2
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# App updates: $DATA_DIR/updates holds latest.json and the files it points at. Published by
+# stream-thing's scripts/publish-update.mjs over scp; this server only reads them.
+UPDATE_FILE_TYPES = {
+    ".apk": "application/vnd.android.package-archive",
+    ".exe": "application/octet-stream",
+}
+UPDATE_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def now_ms() -> int:
@@ -587,6 +595,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}
+
+    # --- app updates (public, read-only) ---
+
+    updates_dir = Path(settings.data_dir) / "updates"
+    # Always revalidated: a re-published build under the same name must never be served
+    # stale by the tunnel's edge, or the app's sha256 check fails.
+    no_cache = {"Cache-Control": "no-cache"}
+
+    @app.api_route("/updates/latest.json", methods=["GET", "HEAD"], include_in_schema=False)
+    async def update_manifest():
+        path = updates_dir / "latest.json"
+        try:
+            raw = await run_in_threadpool(path.read_bytes)
+        except (FileNotFoundError, NotADirectoryError):
+            raise ApiError(404, "no update published")
+        try:
+            json.loads(raw)
+        except ValueError:
+            log.error("updates/latest.json is not valid JSON")
+            raise ApiError(503, "update manifest unreadable")
+        return Response(raw, media_type="application/json", headers=no_cache)
+
+    @app.api_route("/updates/files/{name}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def update_file(name: str):
+        media_type = UPDATE_FILE_TYPES.get(Path(name).suffix.lower())
+        if not media_type or not UPDATE_FILE_NAME.match(name) or ".." in name:
+            raise ApiError(404, "not found")
+        path = updates_dir / name
+        # Belt and braces: the pattern already rules out separators.
+        if path.resolve().parent != updates_dir.resolve() or not path.is_file():
+            raise ApiError(404, "not found")
+        # FileResponse streams from disk and answers Range requests.
+        return FileResponse(path, media_type=media_type, filename=name, headers=no_cache,
+                            content_disposition_type="attachment")
 
     # --- in-app sign-in (returns a device token) ---
 

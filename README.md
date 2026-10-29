@@ -73,6 +73,31 @@ The website is for managing the account; devices sign in from inside the app.
 Pages: `/` (account: keys, devices, sign out, delete), `/privacy`, `/terms`.
 `GET /healthz` → `{"ok": true}`.
 
+### App updates (public, read-only)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET/HEAD | `/updates/latest.json` | The newest published build, served from `$DATA_DIR/updates/latest.json` with `Cache-Control: no-cache`. 404 `{"error": "no update published"}` if there is none, 503 if the file isn't valid JSON |
+| GET/HEAD | `/updates/files/<name>` | A build from `$DATA_DIR/updates/`. Only `.apk` (`application/vnd.android.package-archive`) and `.exe` (`application/octet-stream`); names are `[A-Za-z0-9][A-Za-z0-9._-]*`, nothing else (and no subdirectories) is reachable. Supports `Range` |
+
+```json
+{
+  "version": "0.3.0",
+  "notes": "What changed",
+  "published": "2026-10-29T20:00:00.000Z",
+  "android": {
+    "arm64": {"url": "/updates/files/stream-thing-0.3.0-arm64.apk", "sha256": "…", "size": 123},
+    "armv7": {"url": "/updates/files/stream-thing-0.3.0-armv7.apk", "sha256": "…", "size": 123}
+  },
+  "windows": {"url": "/updates/files/stream-thing-0.3.0-windows.exe", "sha256": "…", "size": 123}
+}
+```
+
+URLs are relative to this server. The server never writes here: stream-thing's
+`scripts/publish-update.mjs` uploads the files with `scp` (to
+`/mnt/data/stream-thing-sync/updates/` on the box), then `latest.json` last, each
+renamed into place so a half-uploaded file is never served.
+
 ## Security notes
 
 - API keys are encrypted with Fernet (`SECRET_KEY`) before they touch the
