@@ -1,4 +1,4 @@
-"""stream-thing-sync: accounts, encrypted API keys and watch progress for stream-thing.
+"""stream-thing-sync: accounts, encrypted API keys, and per-profile watch progress and My list for stream-thing.
 
 One file on purpose: a FastAPI app over a single SQLite database. See README.md
 for the API contract. Secrets (SECRET_KEY, GOOGLE_DESKTOP_CLIENT_SECRET) come
@@ -49,13 +49,18 @@ CREDENTIAL_KEYS = ("debrid_service", "torbox", "realdebrid", "mdblist", "poster"
 DEBRID_SERVICES = ("torbox", "realdebrid")
 MAX_CREDENTIAL_LEN = 512
 MAX_PROGRESS_ENTRIES = 500
+MAX_LIST_ENTRIES = 500
+MAX_LIST_TEXT = 512
+MAX_PROFILES = 12
+PROFILE_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
+PROFILE_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_DEVICE_NAME_LEN = 80
 MAX_BODY_BYTES = 1_000_000
 MAX_NUMBER = 1e10
 LAST_USED_RESOLUTION_MS = 60_000
 VIDEO_ID_RE = re.compile(r"^[\x21-\x7e]{1,200}$")  # printable ASCII, no spaces
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # App updates: $DATA_DIR/updates holds latest.json and the files it points at. Published by
@@ -239,15 +244,41 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 CREATE TABLE IF NOT EXISTS progress (
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    profile    TEXT NOT NULL DEFAULT 'main',
     video_id   TEXT NOT NULL,
     position   REAL,
     duration   REAL,
     watched    INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,  -- the device's clock: decides which write wins
     changed_at INTEGER NOT NULL,  -- the server's clock: what `since` filters on
-    PRIMARY KEY (user_id, video_id)
+    PRIMARY KEY (user_id, profile, video_id)
 );
 CREATE INDEX IF NOT EXISTS progress_since ON progress(user_id, changed_at);
+CREATE TABLE IF NOT EXISTS list_items (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    profile    TEXT NOT NULL DEFAULT 'main',
+    title_id   TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    poster     TEXT,
+    added_at   INTEGER NOT NULL,
+    removed    INTEGER NOT NULL,  -- a removal is kept, so it reaches the other devices
+    updated_at INTEGER NOT NULL,  -- the device's clock: decides which write wins
+    changed_at INTEGER NOT NULL,  -- the server's clock: what `since` filters on
+    PRIMARY KEY (user_id, profile, title_id)
+);
+CREATE INDEX IF NOT EXISTS list_since ON list_items(user_id, changed_at);
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    profile    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    color      TEXT NOT NULL,
+    removed    INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, profile)
+);
+CREATE INDEX IF NOT EXISTS profiles_since ON profiles(user_id, changed_at);
 """
 
 
@@ -263,6 +294,28 @@ class Database:
             if current < 2:
                 # v2: the device-code sign-in flow was removed.
                 c.execute("DROP TABLE IF EXISTS link_requests")
+            if current < 3:
+                # v3: profiles. Progress written before them belongs to the "main" profile.
+                cols = {r[1] for r in c.execute("PRAGMA table_info(progress)")}
+                if "profile" not in cols:
+                    c.executescript("""
+                        CREATE TABLE progress_v3 (
+                            user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            profile    TEXT NOT NULL DEFAULT 'main',
+                            video_id   TEXT NOT NULL,
+                            position   REAL,
+                            duration   REAL,
+                            watched    INTEGER NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            changed_at INTEGER NOT NULL,
+                            PRIMARY KEY (user_id, profile, video_id)
+                        );
+                        INSERT INTO progress_v3 (user_id, profile, video_id, position, duration, watched, updated_at, changed_at)
+                            SELECT user_id, 'main', video_id, position, duration, watched, updated_at, changed_at FROM progress;
+                        DROP TABLE progress;
+                        ALTER TABLE progress_v3 RENAME TO progress;
+                        CREATE INDEX IF NOT EXISTS progress_since ON progress(user_id, changed_at);
+                    """)
             if current < SCHEMA_VERSION:
                 c.execute("DELETE FROM schema_version")
                 c.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
@@ -693,6 +746,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             d = device_auth(conn, request)
             return put_credentials(conn, d["user_id"], body)
 
+    def profile_of(request: Request) -> str:
+        """Which profile a progress or My list call is for. Absent means the first one."""
+        profile = request.query_params.get("profile") or "main"
+        if not PROFILE_ID_RE.match(profile):
+            raise ApiError(400, "invalid profile")
+        return profile
+
     def sync_watermark() -> int:
         # The `now` handed to clients as their next `since`. One ms behind the
         # clock: a write later in this same millisecond gets changed_at == now_ms(),
@@ -715,8 +775,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # must not be able to hide its updates from the others.
             rows = conn.execute(
                 """SELECT video_id, position, duration, watched, updated_at FROM progress
-                   WHERE user_id = ? AND changed_at > ?""",
-                (d["user_id"], since_ms),
+                   WHERE user_id = ? AND profile = ? AND changed_at > ?""",
+                (d["user_id"], profile_of(request), since_ms),
             ).fetchall()
         return {
             "progress": {
@@ -756,15 +816,181 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             rows.append((video_id, position, duration, int(watched), updated, t))
         with db.connect() as conn:
             d = device_auth(conn, request)
+            profile = profile_of(request)
             conn.executemany(
-                """INSERT INTO progress (user_id, video_id, position, duration, watched, updated_at, changed_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(user_id, video_id) DO UPDATE SET
+                """INSERT INTO progress (user_id, profile, video_id, position, duration, watched, updated_at, changed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, profile, video_id) DO UPDATE SET
                        position = excluded.position, duration = excluded.duration, watched = excluded.watched,
                        updated_at = excluded.updated_at, changed_at = excluded.changed_at
                    WHERE excluded.updated_at >= progress.updated_at""",
-                [(d["user_id"],) + r for r in rows],
+                [(d["user_id"], profile) + r for r in rows],
             )
+        return {"ok": True, "now": sync_watermark()}
+
+    @app.get("/api/list")
+    async def get_list(request: Request, since: str = "0"):
+        try:
+            since_ms = int(since)
+        except ValueError:
+            raise ApiError(400, "since must be an integer (ms epoch)")
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            watermark = sync_watermark()
+            rows = conn.execute(
+                """SELECT title_id, type, name, poster, added_at, removed, updated_at FROM list_items
+                   WHERE user_id = ? AND profile = ? AND changed_at > ?""",
+                (d["user_id"], profile_of(request), since_ms),
+            ).fetchall()
+        return {
+            "list": {
+                r["title_id"]: {"type": r["type"], "name": r["name"], "poster": r["poster"],
+                                "addedAt": int(r["added_at"]), "removed": bool(r["removed"]),
+                                "updatedAt": int(r["updated_at"])}
+                for r in rows
+            },
+            "now": watermark,
+        }
+
+    @app.post("/api/list")
+    async def post_list(request: Request):
+        """My list, same rules as progress: newest updatedAt wins, removals included."""
+        body = await read_json(request)
+        entries = body.get("list")
+        if not isinstance(entries, dict):
+            raise ApiError(400, 'expected {"list": {...}}')
+        if len(entries) > MAX_LIST_ENTRIES:
+            raise ApiError(400, f"at most {MAX_LIST_ENTRIES} entries per request")
+        t = now_ms()
+
+        def text(entry: dict, key: str, required: bool):
+            value = entry.get(key)
+            if value is None and not required:
+                return None
+            if not isinstance(value, str) or (required and not value) or len(value) > MAX_LIST_TEXT:
+                raise ApiError(400, f"{key} must be a string of at most {MAX_LIST_TEXT} characters")
+            return value
+
+        def ms(entry: dict, key: str) -> int:
+            value = entry.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                    or value <= 0:
+                raise ApiError(400, f"{key} must be a positive ms epoch")
+            # A device clock running ahead must not win forever: clamp to server time.
+            return min(int(value), t)
+
+        rows = []
+        for title_id, entry in entries.items():
+            if not VIDEO_ID_RE.match(title_id):
+                raise ApiError(400, "invalid title id")
+            if not isinstance(entry, dict):
+                raise ApiError(400, f"entry for {title_id} must be an object")
+            removed = entry.get("removed", False)
+            if not isinstance(removed, bool):
+                raise ApiError(400, "removed must be a boolean")
+            updated = ms(entry, "updatedAt")
+            if removed:
+                # A removal needs nothing but the id; what was known about it is kept.
+                kind = text(entry, "type", False) or ""
+                name = text(entry, "name", False) or ""
+                poster = None
+                added = updated
+            else:
+                kind = text(entry, "type", True)
+                name = text(entry, "name", True)
+                poster = text(entry, "poster", False)
+                added = ms(entry, "addedAt")
+            rows.append((title_id, kind, name, poster, added, int(removed), updated, t))
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            profile = profile_of(request)
+            conn.executemany(
+                """INSERT INTO list_items (user_id, profile, title_id, type, name, poster, added_at, removed, updated_at, changed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, profile, title_id) DO UPDATE SET
+                       type = CASE WHEN excluded.removed THEN list_items.type ELSE excluded.type END,
+                       name = CASE WHEN excluded.removed THEN list_items.name ELSE excluded.name END,
+                       poster = CASE WHEN excluded.removed THEN list_items.poster ELSE excluded.poster END,
+                       added_at = CASE WHEN excluded.removed THEN list_items.added_at ELSE excluded.added_at END,
+                       removed = excluded.removed, updated_at = excluded.updated_at, changed_at = excluded.changed_at
+                   WHERE excluded.updated_at >= list_items.updated_at""",
+                [(d["user_id"], profile) + r for r in rows],
+            )
+        return {"ok": True, "now": sync_watermark()}
+
+    @app.get("/api/profiles")
+    async def get_profiles(request: Request, since: str = "0"):
+        try:
+            since_ms = int(since)
+        except ValueError:
+            raise ApiError(400, "since must be an integer (ms epoch)")
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            watermark = sync_watermark()
+            rows = conn.execute(
+                """SELECT profile, name, color, removed, updated_at FROM profiles
+                   WHERE user_id = ? AND changed_at > ?""",
+                (d["user_id"], since_ms),
+            ).fetchall()
+        return {
+            "profiles": {
+                r["profile"]: {"name": r["name"], "color": r["color"], "removed": bool(r["removed"]),
+                               "updatedAt": int(r["updated_at"])}
+                for r in rows
+            },
+            "now": watermark,
+        }
+
+    @app.post("/api/profiles")
+    async def post_profiles(request: Request):
+        """Profiles on the account: newest updatedAt wins. Removing one deletes its progress and list."""
+        body = await read_json(request)
+        entries = body.get("profiles")
+        if not isinstance(entries, dict):
+            raise ApiError(400, 'expected {"profiles": {...}}')
+        t = now_ms()
+        rows = []
+        for profile, entry in entries.items():
+            if not PROFILE_ID_RE.match(profile):
+                raise ApiError(400, "invalid profile id")
+            if not isinstance(entry, dict):
+                raise ApiError(400, f"entry for {profile} must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip() or len(name) > 40:
+                raise ApiError(400, "name must be 1-40 characters")
+            color = entry.get("color")
+            if not isinstance(color, str) or not PROFILE_COLOR_RE.match(color):
+                raise ApiError(400, "color must be #rrggbb")
+            removed = entry.get("removed", False)
+            if not isinstance(removed, bool):
+                raise ApiError(400, "removed must be a boolean")
+            if removed and profile == "main":
+                raise ApiError(400, "the main profile can't be removed")
+            updated = entry.get("updatedAt")
+            if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not math.isfinite(updated) \
+                    or updated <= 0:
+                raise ApiError(400, "updatedAt must be a positive ms epoch")
+            rows.append((profile, name.strip(), color, int(removed), min(int(updated), t), t))
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            live = {r[0] for r in conn.execute(
+                "SELECT profile FROM profiles WHERE user_id = ? AND removed = 0", (d["user_id"],))}
+            adding = {r[0] for r in rows if not r[3]} - live
+            if len(live | adding) > MAX_PROFILES:
+                raise ApiError(400, f"at most {MAX_PROFILES} profiles")
+            for r in rows:
+                cur = conn.execute(
+                    """INSERT INTO profiles (user_id, profile, name, color, removed, updated_at, changed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(user_id, profile) DO UPDATE SET
+                           name = excluded.name, color = excluded.color, removed = excluded.removed,
+                           updated_at = excluded.updated_at, changed_at = excluded.changed_at
+                       WHERE excluded.updated_at >= profiles.updated_at""",
+                    (d["user_id"],) + r,
+                )
+                if r[3] and cur.rowcount:
+                    conn.execute("DELETE FROM progress WHERE user_id = ? AND profile = ?", (d["user_id"], r[0]))
+                    conn.execute("DELETE FROM list_items WHERE user_id = ? AND profile = ?", (d["user_id"], r[0]))
         return {"ok": True, "now": sync_watermark()}
 
     @app.post("/api/logout")

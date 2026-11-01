@@ -476,7 +476,7 @@ def test_old_link_table_is_dropped(tmp_path):
     appmod.create_app(make_settings(tmp_path))
     names = {r[0] for r in db_rows_path(tmp_path, "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "link_requests" not in names and "progress" in names
-    assert db_rows_path(tmp_path, "SELECT version FROM schema_version") == [(2,)]
+    assert db_rows_path(tmp_path, "SELECT version FROM schema_version") == [(appmod.SCHEMA_VERSION,)]
 
 
 def db_rows_path(path, sql):
@@ -504,3 +504,129 @@ def test_debrid_credentials(make_client):
                  json={"credentials": {"debrid_service": "alldebrid"}}).status_code == 400
     r = d.put("/api/credentials", headers=h, json={"credentials": {"debrid_service": None, "realdebrid": ""}})
     assert r.json()["credentials"] == {"torbox": "tb-KEY"}
+
+
+# ------------------------------------------------------------------- my list ----
+
+def test_list_sync_newest_wins_and_removals_travel(make_client, clock):
+    web, a, b = make_client(), make_client(), make_client()
+    sign_in(web)
+    ta, tb = link_device(web, a, "PC"), link_device(web, b, "TV")
+    t0 = clock()
+
+    r = a.post("/api/list", headers=bearer(ta), json={"list": {
+        "tt5875444": {"type": "series", "name": "Slow Horses", "poster": "https://x/p.jpg", "addedAt": t0 - 100, "updatedAt": t0 - 100},
+        "tt0133093": {"type": "movie", "name": "The Matrix", "poster": None, "addedAt": t0 - 100, "updatedAt": t0 - 100},
+    }})
+    assert r.json() == {"ok": True, "now": t0 - 1}
+    full = b.get("/api/list", headers=bearer(tb)).json()
+    assert full["list"]["tt5875444"] == {"type": "series", "name": "Slow Horses", "poster": "https://x/p.jpg",
+                                         "addedAt": t0 - 100, "removed": False, "updatedAt": t0 - 100}
+
+    clock.advance(10)
+    # The TV removes the film; an older re-add from elsewhere loses.
+    b.post("/api/list", headers=bearer(tb), json={"list": {"tt0133093": {"removed": True, "updatedAt": t0 + 5}}})
+    a.post("/api/list", headers=bearer(ta), json={"list": {
+        "tt0133093": {"type": "movie", "name": "The Matrix", "addedAt": t0 - 50, "updatedAt": t0 - 50}}})
+    since = a.get(f"/api/list?since={full['now'] + 1}", headers=bearer(ta)).json()["list"]
+    assert set(since) == {"tt0133093"}
+    assert since["tt0133093"]["removed"] is True
+    # What was known about it survives the removal.
+    assert since["tt0133093"]["name"] == "The Matrix"
+
+    clock.advance(10)
+    a.post("/api/list", headers=bearer(ta), json={"list": {
+        "tt0133093": {"type": "movie", "name": "The Matrix", "addedAt": clock(), "updatedAt": clock()}}})
+    assert b.get("/api/list", headers=bearer(tb)).json()["list"]["tt0133093"]["removed"] is False
+
+
+def test_list_isolated_and_validated(make_client):
+    w1, w2, d1, d2 = make_client(), make_client(), make_client(), make_client()
+    sign_in(w1, "alice"); sign_in(w2, "bob")
+    t1, t2 = link_device(w1, d1), link_device(w2, d2)
+    ok = {"type": "series", "name": "X", "addedAt": 1000, "updatedAt": 1000}
+    assert d1.post("/api/list", headers=bearer(t1), json={"list": {"tt1": ok}}).status_code == 200
+    assert d2.get("/api/list", headers=bearer(t2)).json()["list"] == {}
+
+    def post(entries):
+        return d1.post("/api/list", headers=bearer(t1), json={"list": entries}).status_code
+
+    assert post({"x" * 201: ok}) == 400
+    assert post({"tt1": {**ok, "name": ""}}) == 400
+    assert post({"tt1": {**ok, "updatedAt": -1}}) == 400
+    assert post({"tt1": {**ok, "removed": "yes"}}) == 400
+    assert post({"tt1": {"removed": True, "updatedAt": 2000}}) == 200
+    assert post({f"tt{i}": ok for i in range(501)}) == 400
+    assert d1.get("/api/list").status_code == 401
+
+
+# ------------------------------------------------------------------ profiles ----
+
+def test_profiles_keep_progress_and_list_apart(make_client):
+    web, a = make_client(), make_client()
+    sign_in(web)
+    h = bearer(link_device(web, a))
+    entry = {"position": 10, "duration": 100, "watched": False, "updatedAt": 1000}
+    a.post("/api/progress", headers=h, json={"progress": {"tt1": entry}})
+    a.post("/api/progress?profile=kid-1", headers=h, json={"progress": {"tt2": entry}})
+    assert set(a.get("/api/progress", headers=h).json()["progress"]) == {"tt1"}
+    assert set(a.get("/api/progress?profile=main", headers=h).json()["progress"]) == {"tt1"}
+    assert set(a.get("/api/progress?profile=kid-1", headers=h).json()["progress"]) == {"tt2"}
+
+    item = {"type": "series", "name": "X", "addedAt": 1000, "updatedAt": 1000}
+    a.post("/api/list?profile=kid-1", headers=h, json={"list": {"tt9": item}})
+    assert a.get("/api/list", headers=h).json()["list"] == {}
+    assert set(a.get("/api/list?profile=kid-1", headers=h).json()["list"]) == {"tt9"}
+    assert a.get("/api/progress?profile=Bad%20Id", headers=h).status_code == 400
+
+
+def test_profiles_sync_and_removal_clears_their_data(make_client, clock):
+    web, a, b = make_client(), make_client(), make_client()
+    sign_in(web)
+    ha, hb = bearer(link_device(web, a)), bearer(link_device(web, b))
+    t = clock()
+    r = a.post("/api/profiles", headers=ha, json={"profiles": {
+        "main": {"name": "Ziggy", "color": "#ff4d5e", "updatedAt": t},
+        "kid-1": {"name": "Kids", "color": "#3ddc84", "updatedAt": t},
+    }})
+    assert r.status_code == 200
+    got = b.get("/api/profiles", headers=hb).json()["profiles"]
+    assert got["kid-1"] == {"name": "Kids", "color": "#3ddc84", "removed": False, "updatedAt": t}
+
+    entry = {"position": 1, "duration": 2, "watched": False, "updatedAt": 1000}
+    b.post("/api/progress?profile=kid-1", headers=hb, json={"progress": {"tt1": entry}})
+    clock.advance(5)
+    a.post("/api/profiles", headers=ha, json={"profiles": {
+        "kid-1": {"name": "Kids", "color": "#3ddc84", "removed": True, "updatedAt": clock()}}})
+    assert b.get("/api/progress?profile=kid-1", headers=hb).json()["progress"] == {}
+    assert b.get("/api/profiles", headers=hb).json()["profiles"]["kid-1"]["removed"] is True
+    # Main can't go, and bad input is refused.
+    bad = {"name": "Me", "color": "#ff4d5e", "removed": True, "updatedAt": clock()}
+    assert a.post("/api/profiles", headers=ha, json={"profiles": {"main": bad}}).status_code == 400
+    assert a.post("/api/profiles", headers=ha, json={"profiles": {"x": {**bad, "removed": False, "color": "red"}}}).status_code == 400
+    many = {f"p{i}": {"name": f"P{i}", "color": "#000000", "updatedAt": clock()} for i in range(13)}
+    assert a.post("/api/profiles", headers=ha, json={"profiles": many}).status_code == 400
+
+
+def test_progress_from_before_profiles_is_kept_as_main(tmp_path):
+    """A database from before v3 keeps its progress, now under the main profile."""
+    import sqlite3
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(path)
+    c.executescript("""
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (2);
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, google_sub TEXT, email TEXT, name TEXT, created_at INTEGER);
+        INSERT INTO users (id, google_sub, email, name, created_at) VALUES (1, 's', 'a@b', 'A', 1);
+        CREATE TABLE progress (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            video_id TEXT NOT NULL, position REAL, duration REAL, watched INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL, changed_at INTEGER NOT NULL, PRIMARY KEY (user_id, video_id));
+        INSERT INTO progress VALUES (1, 'tt0133093', 12.5, 100, 0, 5, 6);
+    """)
+    c.commit(); c.close()
+    appmod.Database(path)
+    appmod.Database(path)  # a second start changes nothing
+    c = sqlite3.connect(path)
+    assert c.execute("SELECT profile, video_id, position FROM progress").fetchall() == [("main", "tt0133093", 12.5)]
+    assert c.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == appmod.SCHEMA_VERSION

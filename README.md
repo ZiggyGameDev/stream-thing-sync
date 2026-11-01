@@ -7,7 +7,7 @@ app for Windows, Android phones and Android TV. It lets people:
   verification),
 - keep their API keys (TorBox or Real-Debrid, MDBList, aioratings poster key)
   encrypted on the server so a new device picks them up automatically,
-- sync watch progress between devices (this replaces Simkl in the app),
+- sync watch progress and My list between devices (this replaces Simkl in the app),
 - manage their keys and signed-in devices, or delete their account, on the
   website.
 
@@ -41,7 +41,16 @@ rate-limited per client IP (shared budget, 10/minute).
 | PUT | `/api/credentials` | `{"credentials": {...}}` merge: string sets, `""`/`null` removes, unknown key → 400, max 512 chars. Returns the GET shape |
 | GET | `/api/progress?since=ms` | `{"progress": {"<videoId>": {"position", "duration", "watched", "updatedAt"}}, "now": ms}` |
 | POST | `/api/progress` | `{"progress": {"<videoId>": {...}}}` → `{"ok": true, "now": ms}`. Newest `updatedAt` wins (ties go to the incoming write). ≤500 entries, videoId ≤200 printable ASCII chars |
+| GET | `/api/list?since=ms` | My list: `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "removed", "updatedAt"}}, "now": ms}` |
+| POST | `/api/list` | `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "updatedAt"}}}`, or `{"removed": true, "updatedAt"}` to take one off → `{"ok": true, "now": ms}`. Same rules as progress: newest `updatedAt` wins, removals are kept so they reach other devices. ≤500 entries |
+| GET | `/api/profiles?since=ms` | `{"profiles": {"<id>": {"name", "color", "removed", "updatedAt"}}, "now": ms}` |
+| POST | `/api/profiles` | `{"profiles": {"<id>": {"name", "color", "removed"?, "updatedAt"}}}` → `{"ok": true, "now": ms}`. Newest wins. Ids `[a-z0-9-]{1,40}`, name 1–40 chars, color `#rrggbb`, ≤12 profiles. Removing one deletes its progress and list; `main` can't be removed |
 | POST | `/api/logout` | Revokes the calling token |
+
+**Profiles.** Progress and My list belong to a profile: add `?profile=<id>` to
+`/api/progress` and `/api/list` (GET and POST). Without it, the call is for `main`,
+which is also where everything synced before profiles existed lives. Keys are
+shared by every profile on the account.
 
 Credential keys: `debrid_service` (`"torbox"` or `"realdebrid"`), `torbox`
 (TorBox API key), `realdebrid` (Real-Debrid API token), `mdblist`, `poster`
