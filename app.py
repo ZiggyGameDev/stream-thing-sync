@@ -59,6 +59,14 @@ MAX_BODY_BYTES = 1_000_000
 MAX_NUMBER = 1e10
 LAST_USED_RESOLUTION_MS = 60_000
 VIDEO_ID_RE = re.compile(r"^[\x21-\x7e]{1,200}$")  # printable ASCII, no spaces
+PARTY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
+PARTY_CODE_LEN = 6
+PARTY_NAME_LEN = 40
+PARTY_MAX_MEMBERS = 12
+PARTY_MEMBER_TIMEOUT_S = 60
+PARTY_IDLE_S = 6 * 3600
+REPORT_MESSAGE_LEN = 4000
+REPORT_LOG_LEN = 300_000
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCHEMA_VERSION = 3
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -1080,6 +1088,233 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.delete_cookie(SESSION_COOKIE, path="/", secure=settings.secure_cookies, httponly=True,
                                samesite="lax")
         return response
+
+    # --- watch together ---
+    #
+    # A party is a code, who is in it, what the host is playing and where. It lives in
+    # memory only: nothing about it is worth keeping past a restart, and nobody needs an
+    # account to join one, just the code. Each member polls about once a second; members
+    # gone quiet for a minute are dropped, the host passes to whoever joined next, and an
+    # empty party disappears.
+
+    parties: dict[str, dict] = {}
+    parties_lock = threading.Lock()
+    party_create_limiter = TokenBucket(capacity=10, per_seconds=3600)
+    party_join_limiter = TokenBucket(capacity=30, per_seconds=600)
+    party_poll_limiter = TokenBucket(capacity=600, per_seconds=60)
+
+    def party_name(body: dict) -> str:
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return "Guest"
+        return " ".join(name.split())[:PARTY_NAME_LEN]
+
+    def party_media(value) -> dict | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ApiError(400, "media must be an object or null")
+        video_id = value.get("videoId")
+        kind = value.get("type")
+        if not isinstance(video_id, str) or not VIDEO_ID_RE.match(video_id):
+            raise ApiError(400, "media.videoId is required")
+        if not isinstance(kind, str) or not re.match(r"^[a-z]{1,20}$", kind):
+            raise ApiError(400, "media.type is required")
+        out = {"videoId": video_id, "type": kind}
+        for key in ("title", "release", "poster", "metaId"):
+            v = value.get(key)
+            if isinstance(v, str) and v:
+                out[key] = v[:MAX_LIST_TEXT]
+        return out
+
+    def party_playback(value, member_id: str) -> dict:
+        if not isinstance(value, dict):
+            raise ApiError(400, "playback must be an object")
+        position = check_number(value.get("position"), "playback.position") or 0.0
+        paused = value.get("paused")
+        if not isinstance(paused, bool):
+            raise ApiError(400, "playback.paused must be true or false")
+        return {"paused": paused, "position": position, "at": now_ms(), "by": member_id}
+
+    def party_prune(party: dict) -> None:
+        cutoff = monotonic() - PARTY_MEMBER_TIMEOUT_S
+        for mid in [m for m, info in party["members"].items() if info["seen"] < cutoff]:
+            del party["members"][mid]
+            party["version"] += 1
+        if party["host"] not in party["members"] and party["members"]:
+            # The longest-standing member takes over.
+            party["host"] = min(party["members"].items(), key=lambda kv: kv[1]["joined"])[0]
+            party["version"] += 1
+
+    def party_sweep() -> None:
+        stale = monotonic() - PARTY_IDLE_S
+        for code in list(parties):
+            party = parties[code]
+            party_prune(party)
+            if not party["members"] or party["touched"] < stale:
+                del parties[code]
+
+    def party_view(party: dict, member_id: str) -> dict:
+        return {
+            "code": party["code"],
+            "version": party["version"],
+            "you": member_id,
+            "host": party["host"],
+            "members": [
+                {"id": mid, "name": info["name"], "host": mid == party["host"]}
+                for mid, info in sorted(party["members"].items(), key=lambda kv: kv[1]["joined"])
+            ],
+            "media": party["media"],
+            "playback": party["playback"],
+            "now": now_ms(),
+        }
+
+    def party_member(code: str, request: Request) -> tuple[dict, str]:
+        """The party and the caller's member id, from the code and the x-party-token header."""
+        token = request.headers.get("x-party-token", "")
+        party = parties.get(code.upper())
+        if party is None:
+            raise ApiError(404, "no party with that code")
+        party_prune(party)
+        wanted = sha256_hex(token) if token else ""
+        for mid, info in party["members"].items():
+            if token and hmac.compare_digest(info["token_hash"], wanted):
+                info["seen"] = monotonic()
+                party["touched"] = monotonic()
+                return party, mid
+        raise ApiError(403, "not in this party")
+
+    def party_add(party: dict, name: str) -> tuple[str, str]:
+        if len(party["members"]) >= PARTY_MAX_MEMBERS:
+            raise ApiError(409, "the party is full")
+        member_id = secrets.token_hex(4)
+        token = secrets.token_urlsafe(24)
+        party["members"][member_id] = {
+            "name": name, "token_hash": sha256_hex(token), "seen": monotonic(), "joined": monotonic(),
+        }
+        party["version"] += 1
+        party["touched"] = monotonic()
+        return member_id, token
+
+    @app.post("/api/party")
+    async def party_create(request: Request):
+        if not party_create_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many parties started, try again later")
+        body = await read_json(request)
+        with parties_lock:
+            party_sweep()
+            for _ in range(20):
+                code = "".join(secrets.choice(PARTY_ALPHABET) for _ in range(PARTY_CODE_LEN))
+                if code not in parties:
+                    break
+            else:
+                raise ApiError(503, "could not make a code, try again")
+            party = {"code": code, "version": 0, "host": "", "members": {}, "media": None,
+                     "playback": None, "touched": monotonic()}
+            member_id, token = party_add(party, party_name(body))
+            party["host"] = member_id
+            if body.get("media") is not None:
+                party["media"] = party_media(body.get("media"))
+            if body.get("playback") is not None:
+                party["playback"] = party_playback(body.get("playback"), member_id)
+            parties[code] = party
+            log.info("party %s started", code)
+            return {"token": token, "party": party_view(party, member_id)}
+
+    @app.post("/api/party/{code}/join")
+    async def party_join(code: str, request: Request):
+        if not party_join_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many tries, wait a minute")
+        body = await read_json(request)
+        with parties_lock:
+            party = parties.get(code.strip().upper())
+            if party is None:
+                raise ApiError(404, "no party with that code")
+            party_prune(party)
+            member_id, token = party_add(party, party_name(body))
+            return {"token": token, "party": party_view(party, member_id)}
+
+    @app.get("/api/party/{code}")
+    async def party_get(code: str, request: Request):
+        if not party_poll_limiter.allow(client_ip(request)):
+            raise ApiError(429, "slow down")
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            return party_view(party, member_id)
+
+    @app.post("/api/party/{code}/state")
+    async def party_state(code: str, request: Request):
+        """What is playing (host only) and play/pause/position (anyone)."""
+        body = await read_json(request)
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            if "media" in body:
+                if member_id != party["host"]:
+                    raise ApiError(403, "only the host picks what to watch")
+                party["media"] = party_media(body.get("media"))
+                party["playback"] = None
+                party["version"] += 1
+            if body.get("playback") is not None:
+                party["playback"] = party_playback(body.get("playback"), member_id)
+                party["version"] += 1
+            return party_view(party, member_id)
+
+    @app.post("/api/party/{code}/leave")
+    async def party_leave(code: str, request: Request):
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            del party["members"][member_id]
+            party["version"] += 1
+            party_prune(party)
+            if not party["members"]:
+                parties.pop(party["code"], None)
+        return {"ok": True}
+
+    # --- problem reports ---
+    #
+    # "Report a problem" in the app: what the person wrote, plus the app's own recent log,
+    # crash log and playback report (stream links already stripped on the device). Each
+    # report is one JSON file under DATA_DIR/reports, read by hand.
+
+    report_limiter = TokenBucket(capacity=6, per_seconds=3600)
+    reports_dir = Path(settings.data_dir) / "reports"
+
+    @app.post("/api/report")
+    async def post_report(request: Request):
+        if not report_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many reports from here, try again later")
+        body = await read_json(request)
+        message = body.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ApiError(400, "say what went wrong")
+        report = {
+            "at": now_ms(),
+            "message": message.strip()[:REPORT_MESSAGE_LEN],
+        }
+        for key in ("version", "platform", "device", "page"):
+            v = body.get(key)
+            if isinstance(v, str):
+                report[key] = v[:200]
+        logs = body.get("logs")
+        if isinstance(logs, dict):
+            report["logs"] = {k[:40]: v[:REPORT_LOG_LEN] for k, v in list(logs.items())[:8]
+                              if isinstance(k, str) and isinstance(v, str)}
+        diagnostics = body.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            report["diagnostics"] = diagnostics
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            try:
+                with db.connect() as conn:
+                    d = device_auth(conn, request)
+                    report["account"] = {"email": d["email"], "device": d["device_name"]}
+            except ApiError:
+                pass  # a stale token doesn't stop the report
+        report_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime(report["at"] / 1000)) + "-" + secrets.token_hex(3)
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        (reports_dir / f"{report_id}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        log.info("problem report %s", report_id)
+        return {"id": report_id}
 
     return app
 
