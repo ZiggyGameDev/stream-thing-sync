@@ -213,3 +213,76 @@ def test_members_say_when_they_have_the_video_loaded(client):
     assert ready == {"Ziggy": "", "Dani": MEDIA["videoId"]}
     r = client.post(f"/api/party/{code}/me", headers=tok(guest["token"]), json={"ready": "bad id!"})
     assert {m["name"]: m["ready"] for m in r.json()["members"]}["Dani"] == ""
+
+
+def test_a_start_can_be_scheduled_a_moment_ahead(client):
+    host = start(client, media=MEDIA)
+    code = host["party"]["code"]
+    now = host["party"]["now"]
+    r = client.post(f"/api/party/{code}/state", headers=tok(host["token"]),
+                    json={"playback": {"paused": False, "position": 12, "at": now + 1500}})
+    assert abs(r.json()["playback"]["at"] - (now + 1500)) < 5
+    # Too far out (or nonsense) is ignored: it holds from now.
+    r = client.post(f"/api/party/{code}/state", headers=tok(host["token"]),
+                    json={"playback": {"paused": False, "position": 12, "at": now + 3_600_000}})
+    assert abs(r.json()["playback"]["at"] - r.json()["now"]) < 1000
+
+
+def test_a_sync_point_starts_once_everyone_has_the_frame(client):
+    host = start(client, media=MEDIA)
+    code = host["party"]["code"]
+    guest = join(client, code)
+    browsing = join(client, code, name="Sam")  # in the catalogue, no film open: not waited for
+    for t in (host, guest):
+        client.post(f"/api/party/{code}/me", headers=tok(t["token"]), json={"ready": MEDIA["videoId"]})
+    r = client.post(f"/api/party/{code}/sync", headers=tok(guest["token"]), json={"position": 600, "play": True})
+    assert r.status_code == 200, r.text
+    view = r.json()
+    sync_id = view["sync"]["id"]
+    # Everyone pauses on the frame first.
+    assert view["playback"]["paused"] is True and view["playback"]["position"] == 600
+    assert view["sync"]["started"] is False
+
+    r = client.post(f"/api/party/{code}/me", headers=tok(host["token"]), json={"ready_sync": sync_id})
+    assert r.json()["sync"]["started"] is False and r.json()["playback"]["paused"] is True
+    # A stale id counts for nothing.
+    client.post(f"/api/party/{code}/me", headers=tok(guest["token"]), json={"ready_sync": sync_id - 1})
+    r = client.post(f"/api/party/{code}/me", headers=tok(guest["token"]), json={"ready_sync": sync_id})
+    view = r.json()
+    assert view["sync"]["started"] is True
+    pb = view["playback"]
+    # It starts for everyone at one moment, a little ahead so everyone hears in time.
+    assert pb["paused"] is False and pb["position"] == 600
+    assert 200 <= pb["at"] - view["now"] <= 400
+
+
+def test_a_sync_point_starts_anyway_after_the_grace_period(client, monkeypatch):
+    monkeypatch.setattr(appmod, "PARTY_SYNC_GRACE_S", 0.2)
+    host = start(client, media=MEDIA)
+    code = host["party"]["code"]
+    join(client, code)
+    client.post(f"/api/party/{code}/sync", headers=tok(host["token"]), json={"position": 30, "play": True})
+    import time as _t
+    _t.sleep(0.5)
+    view = client.get(f"/api/party/{code}", headers=tok(host["token"])).json()
+    assert view["sync"]["started"] is True and view["playback"]["paused"] is False
+
+
+def test_a_sync_point_needs_something_on(client):
+    host = start(client)
+    code = host["party"]["code"]
+    assert client.post(f"/api/party/{code}/sync", headers=tok(host["token"]), json={"position": 1}).status_code == 409
+
+
+def test_a_long_poll_waits_for_a_change_then_gives_up(client):
+    host = start(client)
+    code = host["party"]["code"]
+    v = client.get(f"/api/party/{code}", headers=tok(host["token"])).json()["version"]
+    import time as _t
+    t0 = _t.monotonic()
+    view = client.get(f"/api/party/{code}?v={v}&wait=0.3", headers=tok(host["token"])).json()
+    assert view["version"] == v and _t.monotonic() - t0 >= 0.25
+    # Behind already: answered at once.
+    t0 = _t.monotonic()
+    client.get(f"/api/party/{code}?v={v - 1}&wait=5", headers=tok(host["token"]))
+    assert _t.monotonic() - t0 < 1

@@ -10,6 +10,7 @@ tokens, OAuth codes/verifiers or API keys. uvicorn's access log is turned off
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -70,6 +71,13 @@ PARTY_CHAT_KEEP = 100
 PARTY_CHAT_SENT = 50
 PARTY_AVATAR_RE = re.compile(r"^[a-z0-9-]{1,24}$")
 PARTY_SEARCH_LEN = 100
+# Sync points: how long everyone gets to have the frame ready before it starts anyway, and how
+# far ahead the start is set: 200 ms, the worst ping allowed for (an answer reaches everyone
+# within half a round trip, through their long poll).
+PARTY_SYNC_GRACE_S = 10.0
+PARTY_START_LEAD_MS = 200
+# A poll with ?v= waits up to this long for something to change (a long poll).
+PARTY_WAIT_S = 20.0
 REPORT_MESSAGE_LEN = 4000
 REPORT_LOG_LEN = 300_000
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -1111,6 +1119,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     party_poll_limiter = TokenBucket(capacity=600, per_seconds=60)
     party_chat_limiter = TokenBucket(capacity=20, per_seconds=60)
 
+    # code -> an event set (and replaced) whenever that party changes: long polls wait on it.
+    party_events: dict[str, asyncio.Event] = {}
+
+    def party_bump(party: dict) -> None:
+        party["version"] += 1
+        event = party_events.pop(party["code"], None)
+        if event is not None:
+            event.set()
+
+    def party_sync_start(party: dict) -> None:
+        """Everyone has the frame (or the wait is over): start at one moment, a little ahead."""
+        sync = party.get("sync")
+        if not sync or sync["started"]:
+            return
+        sync["started"] = True
+        at = now_ms() + (PARTY_START_LEAD_MS if sync["play"] else 0)
+        party["playback"] = {"paused": not sync["play"], "position": sync["position"], "at": at, "by": sync["by"]}
+        party_bump(party)
+
+    def party_sync_check(party: dict) -> None:
+        """Start the sync point if everyone is ready, or its grace period is up."""
+        sync = party.get("sync")
+        if not sync or sync["started"]:
+            return
+        # Waiting only on those with the film open: anyone browsing the catalogue has no frame
+        # to get ready, and shouldn't hold everyone else up.
+        video = (party.get("media") or {}).get("videoId")
+        watching = {mid for mid, info in party["members"].items() if video and info.get("ready") == video}
+        if watching <= sync["ready"] or monotonic() >= sync["deadline"]:
+            party_sync_start(party)
+
+    def party_sync_timeout(code: str, sync_id: int) -> None:
+        with parties_lock:
+            party = parties.get(code)
+            sync = party and party.get("sync")
+            if sync and sync["id"] == sync_id:
+                party_sync_start(party)
+
     def party_avatar(value) -> str:
         return value if isinstance(value, str) and PARTY_AVATAR_RE.match(value) else ""
 
@@ -1169,17 +1215,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         paused = value.get("paused")
         if not isinstance(paused, bool):
             raise ApiError(400, "playback.paused must be true or false")
-        return {"paused": paused, "position": position, "at": now_ms(), "by": member_id}
+        # `at`: the server time this holds from. Normally now; a member can schedule it a
+        # moment ahead (a start everyone makes at the same instant), within ten seconds.
+        at = now_ms()
+        wanted = value.get("at")
+        if isinstance(wanted, (int, float)) and not isinstance(wanted, bool) and abs(wanted - at) <= 10_000:
+            at = int(wanted)
+        return {"paused": paused, "position": position, "at": at, "by": member_id}
 
     def party_prune(party: dict) -> None:
         cutoff = monotonic() - PARTY_MEMBER_TIMEOUT_S
         for mid in [m for m, info in party["members"].items() if info["seen"] < cutoff]:
             del party["members"][mid]
-            party["version"] += 1
+            party_bump(party)
+            party_sync_check(party)
         if party["host"] not in party["members"] and party["members"]:
             # The longest-standing member takes over.
             party["host"] = min(party["members"].items(), key=lambda kv: kv[1]["joined"])[0]
-            party["version"] += 1
+            party_bump(party)
 
     def party_sweep() -> None:
         stale = monotonic() - PARTY_IDLE_S
@@ -1188,6 +1241,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             party_prune(party)
             if not party["members"] or party["touched"] < stale:
                 del parties[code]
+
+    def party_sync_view(party: dict) -> dict | None:
+        sync = party.get("sync")
+        if not sync:
+            return None
+        return {"id": sync["id"], "position": sync["position"], "play": sync["play"], "by": sync["by"],
+                "started": sync["started"], "ready": sorted(sync["ready"])}
 
     def party_view(party: dict, member_id: str) -> dict:
         return {
@@ -1201,6 +1261,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for mid, info in sorted(party["members"].items(), key=lambda kv: kv[1]["joined"])
             ],
             "chat": party["chat"][-PARTY_CHAT_SENT:],
+            "sync": party_sync_view(party),
             "media": party["media"],
             "playback": party["playback"],
             "now": now_ms(),
@@ -1213,6 +1274,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if party is None:
             raise ApiError(404, "no party with that code")
         party_prune(party)
+        party_sync_check(party)
         wanted = sha256_hex(token) if token else ""
         for mid, info in party["members"].items():
             if token and hmac.compare_digest(info["token_hash"], wanted):
@@ -1230,7 +1292,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "name": name, "avatar": avatar, "activity": None,
             "token_hash": sha256_hex(token), "seen": monotonic(), "joined": monotonic(),
         }
-        party["version"] += 1
+        party_bump(party)
         party["touched"] = monotonic()
         return member_id, token
 
@@ -1248,7 +1310,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 raise ApiError(503, "could not make a code, try again")
             party = {"code": code, "version": 0, "host": "", "members": {}, "media": None,
-                     "playback": None, "chat": [], "chat_seq": 0, "touched": monotonic()}
+                     "playback": None, "chat": [], "chat_seq": 0, "sync": None, "sync_seq": 0,
+                     "touched": monotonic()}
             member_id, token = party_add(party, party_name(body), party_avatar(body.get("avatar")))
             party["host"] = member_id
             if body.get("media") is not None:
@@ -1278,6 +1341,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ApiError(429, "slow down")
         with parties_lock:
             party, member_id = party_member(code, request)
+            seen = request.query_params.get("v")
+            if seen is None or str(party["version"]) != seen:
+                return party_view(party, member_id)
+            # Nothing new since the version the caller has: wait for a change, so it hears of
+            # one within a round trip rather than at its next poll.
+            event = party_events.setdefault(party["code"], asyncio.Event())
+        try:
+            wait = min(PARTY_WAIT_S, max(0.0, float(request.query_params.get("wait", PARTY_WAIT_S))))
+        except ValueError:
+            wait = PARTY_WAIT_S
+        try:
+            await asyncio.wait_for(event.wait(), timeout=wait)
+        except asyncio.TimeoutError:
+            pass
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            return party_view(party, member_id)
+
+    @app.post("/api/party/{code}/sync")
+    async def party_sync(code: str, request: Request):
+        """A sync point: everyone pauses on `position`, says when that frame is ready, and it
+        starts for all at one moment (or stays paused, if `play` is false)."""
+        body = await read_json(request)
+        position = check_number(body.get("position"), "position") or 0.0
+        play = body.get("play", True)
+        if not isinstance(play, bool):
+            raise ApiError(400, "play must be true or false")
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            if not party["media"]:
+                raise ApiError(409, "nothing is on")
+            party["sync_seq"] += 1
+            sync_id = party["sync_seq"]
+            party["sync"] = {"id": sync_id, "position": position, "play": play, "by": member_id,
+                             "ready": set(), "started": False, "deadline": monotonic() + PARTY_SYNC_GRACE_S}
+            party["playback"] = {"paused": True, "position": position, "at": now_ms(), "by": member_id}
+            party_bump(party)
+            asyncio.get_running_loop().call_later(PARTY_SYNC_GRACE_S, party_sync_timeout, party["code"], sync_id)
             return party_view(party, member_id)
 
     @app.post("/api/party/{code}/state")
@@ -1292,10 +1393,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if not same:
                     party["media"] = {**media, "by": member_id} if media else None
                     party["playback"] = None
-                    party["version"] += 1
+                    party["sync"] = None
+                    party_bump(party)
             if body.get("playback") is not None:
                 party["playback"] = party_playback(body.get("playback"), member_id)
-                party["version"] += 1
+                party["sync"] = None
+                party_bump(party)
             return party_view(party, member_id)
 
     @app.post("/api/party/{code}/me")
@@ -1316,7 +1419,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # new pick starts once everyone has it (or after a short grace period).
                 ready = body.get("ready")
                 info["ready"] = ready if isinstance(ready, str) and VIDEO_ID_RE.match(ready) else ""
-            party["version"] += 1
+            if "ready_sync" in body:
+                # This member is paused on the sync point's frame, loaded and ready to go.
+                sync = party.get("sync")
+                if sync and body.get("ready_sync") == sync["id"]:
+                    sync["ready"].add(member_id)
+                    party_sync_check(party)
+            party_bump(party)
             return party_view(party, member_id)
 
     @app.post("/api/party/{code}/chat")
@@ -1336,7 +1445,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "text": " ".join(text.split())[:PARTY_CHAT_LEN], "at": now_ms(),
             })
             del party["chat"][:-PARTY_CHAT_KEEP]
-            party["version"] += 1
+            party_bump(party)
             return party_view(party, member_id)
 
     @app.post("/api/party/{code}/leave")
@@ -1344,7 +1453,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with parties_lock:
             party, member_id = party_member(code, request)
             del party["members"][member_id]
-            party["version"] += 1
+            party_bump(party)
+            party_sync_check(party)
             party_prune(party)
             if not party["members"]:
                 parties.pop(party["code"], None)
