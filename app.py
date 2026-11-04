@@ -65,6 +65,11 @@ PARTY_NAME_LEN = 40
 PARTY_MAX_MEMBERS = 12
 PARTY_MEMBER_TIMEOUT_S = 60
 PARTY_IDLE_S = 6 * 3600
+PARTY_CHAT_LEN = 300
+PARTY_CHAT_KEEP = 100
+PARTY_CHAT_SENT = 50
+PARTY_AVATAR_RE = re.compile(r"^[a-z0-9-]{1,24}$")
+PARTY_SEARCH_LEN = 100
 REPORT_MESSAGE_LEN = 4000
 REPORT_LOG_LEN = 300_000
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -1091,7 +1096,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- watch together ---
     #
-    # A party is a code, who is in it, what the host is playing and where. It lives in
+    # A party is a code, who is in it (name, avatar, and what they're up to: a search, a
+    # title they're looking at), what's on and where, and a short chat. Anyone picks what's
+    # on; the host only keeps the shared position fresh while it plays. It lives in
     # memory only: nothing about it is worth keeping past a restart, and nobody needs an
     # account to join one, just the code. Each member polls about once a second; members
     # gone quiet for a minute are dropped, the host passes to whoever joined next, and an
@@ -1102,6 +1109,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     party_create_limiter = TokenBucket(capacity=10, per_seconds=3600)
     party_join_limiter = TokenBucket(capacity=30, per_seconds=600)
     party_poll_limiter = TokenBucket(capacity=600, per_seconds=60)
+    party_chat_limiter = TokenBucket(capacity=20, per_seconds=60)
+
+    def party_avatar(value) -> str:
+        return value if isinstance(value, str) and PARTY_AVATAR_RE.match(value) else ""
+
+    def party_activity(value) -> dict | None:
+        """What a member is up to outside the player: a search, or a title they have open."""
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ApiError(400, "activity must be an object or null")
+        kind = value.get("kind")
+        if kind == "search":
+            text = value.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return None
+            return {"kind": "search", "text": " ".join(text.split())[:PARTY_SEARCH_LEN], "at": now_ms()}
+        if kind == "title":
+            out = party_media({"videoId": value.get("id"), "type": value.get("type")})
+            title = value.get("title")
+            poster = value.get("poster")
+            return {
+                "kind": "title", "id": out["videoId"], "type": out["type"],
+                "title": title[:MAX_LIST_TEXT] if isinstance(title, str) else "",
+                **({"poster": poster[:MAX_LIST_TEXT]} if isinstance(poster, str) and poster.startswith("https://") else {}),
+                "at": now_ms(),
+            }
+        raise ApiError(400, "activity.kind must be search or title")
 
     def party_name(body: dict) -> str:
         name = body.get("name")
@@ -1161,9 +1196,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "you": member_id,
             "host": party["host"],
             "members": [
-                {"id": mid, "name": info["name"], "host": mid == party["host"]}
+                {"id": mid, "name": info["name"], "avatar": info.get("avatar", ""), "host": mid == party["host"],
+                 "activity": info.get("activity")}
                 for mid, info in sorted(party["members"].items(), key=lambda kv: kv[1]["joined"])
             ],
+            "chat": party["chat"][-PARTY_CHAT_SENT:],
             "media": party["media"],
             "playback": party["playback"],
             "now": now_ms(),
@@ -1184,13 +1221,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return party, mid
         raise ApiError(403, "not in this party")
 
-    def party_add(party: dict, name: str) -> tuple[str, str]:
+    def party_add(party: dict, name: str, avatar: str = "") -> tuple[str, str]:
         if len(party["members"]) >= PARTY_MAX_MEMBERS:
             raise ApiError(409, "the party is full")
         member_id = secrets.token_hex(4)
         token = secrets.token_urlsafe(24)
         party["members"][member_id] = {
-            "name": name, "token_hash": sha256_hex(token), "seen": monotonic(), "joined": monotonic(),
+            "name": name, "avatar": avatar, "activity": None,
+            "token_hash": sha256_hex(token), "seen": monotonic(), "joined": monotonic(),
         }
         party["version"] += 1
         party["touched"] = monotonic()
@@ -1210,11 +1248,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 raise ApiError(503, "could not make a code, try again")
             party = {"code": code, "version": 0, "host": "", "members": {}, "media": None,
-                     "playback": None, "touched": monotonic()}
-            member_id, token = party_add(party, party_name(body))
+                     "playback": None, "chat": [], "chat_seq": 0, "touched": monotonic()}
+            member_id, token = party_add(party, party_name(body), party_avatar(body.get("avatar")))
             party["host"] = member_id
             if body.get("media") is not None:
-                party["media"] = party_media(body.get("media"))
+                party["media"] = {**party_media(body.get("media")), "by": member_id}
             if body.get("playback") is not None:
                 party["playback"] = party_playback(body.get("playback"), member_id)
             parties[code] = party
@@ -1231,7 +1269,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if party is None:
                 raise ApiError(404, "no party with that code")
             party_prune(party)
-            member_id, token = party_add(party, party_name(body))
+            member_id, token = party_add(party, party_name(body), party_avatar(body.get("avatar")))
             return {"token": token, "party": party_view(party, member_id)}
 
     @app.get("/api/party/{code}")
@@ -1244,19 +1282,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/party/{code}/state")
     async def party_state(code: str, request: Request):
-        """What is playing (host only) and play/pause/position (anyone)."""
+        """What is playing and play/pause/position: anyone in the party can change either."""
         body = await read_json(request)
         with parties_lock:
             party, member_id = party_member(code, request)
             if "media" in body:
-                if member_id != party["host"]:
-                    raise ApiError(403, "only the host picks what to watch")
-                party["media"] = party_media(body.get("media"))
-                party["playback"] = None
-                party["version"] += 1
+                media = party_media(body.get("media"))
+                same = media and party["media"] and party["media"]["videoId"] == media["videoId"]
+                if not same:
+                    party["media"] = {**media, "by": member_id} if media else None
+                    party["playback"] = None
+                    party["version"] += 1
             if body.get("playback") is not None:
                 party["playback"] = party_playback(body.get("playback"), member_id)
                 party["version"] += 1
+            return party_view(party, member_id)
+
+    @app.post("/api/party/{code}/me")
+    async def party_me(code: str, request: Request):
+        """This member's name, avatar and what they're up to (each optional)."""
+        body = await read_json(request)
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            info = party["members"][member_id]
+            if "name" in body:
+                info["name"] = party_name(body)
+            if "avatar" in body:
+                info["avatar"] = party_avatar(body.get("avatar"))
+            if "activity" in body:
+                info["activity"] = party_activity(body.get("activity"))
+            party["version"] += 1
+            return party_view(party, member_id)
+
+    @app.post("/api/party/{code}/chat")
+    async def party_chat(code: str, request: Request):
+        body = await read_json(request)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError(400, "say something")
+        with parties_lock:
+            party, member_id = party_member(code, request)
+            if not party_chat_limiter.allow(party["code"] + ":" + member_id):
+                raise ApiError(429, "slow down")
+            info = party["members"][member_id]
+            party["chat_seq"] += 1
+            party["chat"].append({
+                "id": party["chat_seq"], "by": member_id, "name": info["name"], "avatar": info.get("avatar", ""),
+                "text": " ".join(text.split())[:PARTY_CHAT_LEN], "at": now_ms(),
+            })
+            del party["chat"][:-PARTY_CHAT_KEEP]
+            party["version"] += 1
             return party_view(party, member_id)
 
     @app.post("/api/party/{code}/leave")

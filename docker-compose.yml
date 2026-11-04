@@ -39,6 +39,10 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
+    # Parties live in memory only: logs are the one thing that grows, so they're capped.
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   # CLI-managed tunnel: `cloudflared tunnel create/route dns` on the host made
   # the credentials file; config.yml sits next to it (see README and
@@ -57,3 +61,7 @@ services:
     security_opt:
       - no-new-privileges:true
     cap_drop: [ALL]
+    # Parties live in memory only: logs are the one thing that grows, so they're capped.
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
