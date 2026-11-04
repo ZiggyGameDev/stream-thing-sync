@@ -27,7 +27,7 @@ def tok(t):
 def test_start_and_join_with_a_code(client):
     host = start(client, media=MEDIA)
     code = host["party"]["code"]
-    assert len(code) == 6 and code.isalnum() and code.isupper()
+    assert len(code) == 3 and code.isalpha() and code.isupper()
     assert host["party"]["media"]["videoId"] == MEDIA["videoId"]
 
     # The code works in any case and with stray spaces.

@@ -60,8 +60,10 @@ MAX_BODY_BYTES = 1_000_000
 MAX_NUMBER = 1e10
 LAST_USED_RESOLUTION_MS = 60_000
 VIDEO_ID_RE = re.compile(r"^[\x21-\x7e]{1,200}$")  # printable ASCII, no spaces
-PARTY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I/L
-PARTY_CODE_LEN = 6
+# Three letters, easy to type with a TV remote: letters only, none that look alike (I, L, O).
+# 12,167 codes; with the join rate limit, guessing one is slow.
+PARTY_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ"
+PARTY_CODE_LEN = 3
 PARTY_NAME_LEN = 40
 PARTY_MAX_MEMBERS = 12
 PARTY_MEMBER_TIMEOUT_S = 60
@@ -1303,7 +1305,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         body = await read_json(request)
         with parties_lock:
             party_sweep()
-            for _ in range(20):
+            for _ in range(200):
                 code = "".join(secrets.choice(PARTY_ALPHABET) for _ in range(PARTY_CODE_LEN))
                 if code not in parties:
                     break
