@@ -201,3 +201,15 @@ def test_joining_mid_film_gets_where_it_is(client):
     guest = join(client, code)
     assert guest["party"]["media"]["videoId"] == MEDIA["videoId"]
     assert guest["party"]["playback"]["position"] == 1800 and guest["party"]["playback"]["paused"] is False
+
+
+def test_members_say_when_they_have_the_video_loaded(client):
+    host = start(client, media=MEDIA)
+    code = host["party"]["code"]
+    guest = join(client, code)
+    assert all(m["ready"] == "" for m in guest["party"]["members"])
+    r = client.post(f"/api/party/{code}/me", headers=tok(guest["token"]), json={"ready": MEDIA["videoId"]})
+    ready = {m["name"]: m["ready"] for m in r.json()["members"]}
+    assert ready == {"Ziggy": "", "Dani": MEDIA["videoId"]}
+    r = client.post(f"/api/party/{code}/me", headers=tok(guest["token"]), json={"ready": "bad id!"})
+    assert {m["name"]: m["ready"] for m in r.json()["members"]}["Dani"] == ""

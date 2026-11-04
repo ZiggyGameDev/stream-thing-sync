@@ -1197,7 +1197,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "host": party["host"],
             "members": [
                 {"id": mid, "name": info["name"], "avatar": info.get("avatar", ""), "host": mid == party["host"],
-                 "activity": info.get("activity")}
+                 "activity": info.get("activity"), "ready": info.get("ready", "")}
                 for mid, info in sorted(party["members"].items(), key=lambda kv: kv[1]["joined"])
             ],
             "chat": party["chat"][-PARTY_CHAT_SENT:],
@@ -1311,6 +1311,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 info["avatar"] = party_avatar(body.get("avatar"))
             if "activity" in body:
                 info["activity"] = party_activity(body.get("activity"))
+            if "ready" in body:
+                # The video this member has loaded and is holding at its first frame, so a
+                # new pick starts once everyone has it (or after a short grace period).
+                ready = body.get("ready")
+                info["ready"] = ready if isinstance(ready, str) and VIDEO_ID_RE.match(ready) else ""
             party["version"] += 1
             return party_view(party, member_id)
 
