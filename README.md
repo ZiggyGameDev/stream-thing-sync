@@ -11,12 +11,16 @@
 ![Docker](https://img.shields.io/badge/Docker_Compose-ff2d78?style=flat-square&logo=docker&logoColor=white&labelColor=1a0f12)
 [![MIT](https://img.shields.io/badge/license-MIT-c9b8b4?style=flat-square&labelColor=1a0f12)](LICENSE)
 
-**The small account and sync server behind [stream-thing](https://ziggygamedev.github.io/stream-thing-releases/)** —<br>
-a Stremio-style streaming app for Windows, Android phones and Android TV.
+<h3>Your account, keys and watch history — on every device.</h3>
 
-One file (`app.py`) · one page (`static/index.html`) · one SQLite database
+The small account and sync server behind [stream-thing](https://ziggygamedev.github.io/stream-thing-releases/).<br>
+One file (`app.py`) · one page (`static/index.html`) · one SQLite database.
 
-[API](#-api) · [Security](#%EF%B8%8F-security) · [Configuration](#%EF%B8%8F-configuration) · [Run locally](#-run-locally) · [Deployment](#-deployment-cctv)
+**[Run locally](#-run-locally)** ·
+**[API](#-api)** ·
+**[Security](#%EF%B8%8F-security)** ·
+**[Configuration](#%EF%B8%8F-configuration)** ·
+**[Deployment](#-deployment-cctv)**
 
 </div>
 
