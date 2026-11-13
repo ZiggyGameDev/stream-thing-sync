@@ -56,6 +56,11 @@ MAX_PROFILES = 12
 PROFILE_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
 PROFILE_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_DEVICE_NAME_LEN = 80
+DEVICE_KINDS = ("tv", "phone", "desktop")
+MAX_SETTINGS_BYTES = 200_000
+MAX_ADDONS = 60
+MAX_ADDON_URL_LEN = 2000
+ADDON_URL_RE = re.compile(r"^https?://[!-~]+$")  # printable ASCII, no spaces
 MAX_BODY_BYTES = 1_000_000
 MAX_NUMBER = 1e10
 LAST_USED_RESOLUTION_MS = 60_000
@@ -83,7 +88,7 @@ PARTY_WAIT_S = 20.0
 REPORT_MESSAGE_LEN = 4000
 REPORT_LOG_LEN = 300_000
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # App updates: $DATA_DIR/updates holds latest.json and the files it points at. Published by
@@ -302,6 +307,18 @@ CREATE TABLE IF NOT EXISTS profiles (
     PRIMARY KEY (user_id, profile)
 );
 CREATE INDEX IF NOT EXISTS profiles_since ON profiles(user_id, changed_at);
+CREATE TABLE IF NOT EXISTS settings (
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device     TEXT NOT NULL,     -- the kind of device: tv, phone or desktop
+    blob       BLOB NOT NULL,
+    updated_at INTEGER NOT NULL,  -- the device's clock: decides which write wins
+    PRIMARY KEY (user_id, device)
+);
+CREATE TABLE IF NOT EXISTS addons (
+    user_id    INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    blob       BLOB NOT NULL,
+    updated_at INTEGER NOT NULL   -- the device's clock: decides which write wins
+);
 """
 
 
@@ -768,6 +785,112 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.connect() as conn:
             d = device_auth(conn, request)
             return put_credentials(conn, d["user_id"], body)
+
+    # --- settings and addons: one document each, newest wins ---
+    #
+    # Both are encrypted like the keys: an addon's address can carry its owner's own
+    # configuration, keys included.
+
+    def seal(value) -> bytes:
+        return fernet.encrypt(json.dumps(value, separators=(",", ":")).encode())
+
+    def unseal(blob, what: str):
+        try:
+            return json.loads(fernet.decrypt(bytes(blob)))
+        except InvalidToken:
+            log.error("%s could not be decrypted (SECRET_KEY changed?)", what)
+            raise ApiError(500, f"stored {what} could not be decrypted")
+
+    def updated_at_of(body: dict) -> int:
+        value = body.get("updatedAt")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ApiError(400, "updatedAt must be a time in milliseconds")
+        # A device whose clock runs ahead can't lock the others out.
+        return min(int(value), now_ms())
+
+    def device_kind_of(request: Request) -> str:
+        kind = request.query_params.get("device") or "desktop"
+        if kind not in DEVICE_KINDS:
+            raise ApiError(400, f"device must be one of: {', '.join(DEVICE_KINDS)}")
+        return kind
+
+    @app.get("/api/settings")
+    async def get_settings(request: Request):
+        kind = device_kind_of(request)
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            row = conn.execute("SELECT blob, updated_at FROM settings WHERE user_id = ? AND device = ?",
+                               (d["user_id"], kind)).fetchone()
+            if row is None:
+                return {"settings": None, "updatedAt": 0}
+            return {"settings": unseal(row["blob"], "settings"), "updatedAt": int(row["updated_at"])}
+
+    @app.put("/api/settings")
+    async def put_settings(request: Request):
+        kind = device_kind_of(request)
+        body = await read_json(request)
+        incoming = body.get("settings")
+        if not isinstance(incoming, dict):
+            raise ApiError(400, "expected {\"settings\": {...}, \"updatedAt\": ms}")
+        updated_at = updated_at_of(body)
+        blob = seal(incoming)
+        if len(blob) > MAX_SETTINGS_BYTES:
+            raise ApiError(400, "settings are too large")
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            row = conn.execute("SELECT updated_at FROM settings WHERE user_id = ? AND device = ?",
+                               (d["user_id"], kind)).fetchone()
+            # Newest wins; a tie goes to the incoming write.
+            if row is not None and int(row["updated_at"]) > updated_at:
+                return {"ok": True, "stored": False, "updatedAt": int(row["updated_at"])}
+            conn.execute(
+                """INSERT INTO settings (user_id, device, blob, updated_at) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(user_id, device) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at""",
+                (d["user_id"], kind, blob, updated_at),
+            )
+        return {"ok": True, "stored": True, "updatedAt": updated_at}
+
+    def clean_addons(incoming) -> list[dict]:
+        if not isinstance(incoming, list):
+            raise ApiError(400, "expected {\"addons\": [{\"url\": ...}], \"updatedAt\": ms}")
+        if len(incoming) > MAX_ADDONS:
+            raise ApiError(400, f"at most {MAX_ADDONS} addons")
+        out, seen = [], set()
+        for item in incoming:
+            url = item.get("url") if isinstance(item, dict) else None
+            if not isinstance(url, str) or len(url) > MAX_ADDON_URL_LEN or not ADDON_URL_RE.match(url):
+                raise ApiError(400, "each addon needs an http(s) url")
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append({"url": url})
+        return out
+
+    @app.get("/api/addons")
+    async def get_addons(request: Request):
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            row = conn.execute("SELECT blob, updated_at FROM addons WHERE user_id = ?", (d["user_id"],)).fetchone()
+            if row is None:
+                return {"addons": None, "updatedAt": 0}
+            return {"addons": unseal(row["blob"], "addons"), "updatedAt": int(row["updated_at"])}
+
+    @app.put("/api/addons")
+    async def put_addons(request: Request):
+        body = await read_json(request)
+        addons = clean_addons(body.get("addons"))
+        updated_at = updated_at_of(body)
+        with db.connect() as conn:
+            d = device_auth(conn, request)
+            row = conn.execute("SELECT updated_at FROM addons WHERE user_id = ?", (d["user_id"],)).fetchone()
+            if row is not None and int(row["updated_at"]) > updated_at:
+                return {"ok": True, "stored": False, "updatedAt": int(row["updated_at"])}
+            conn.execute(
+                """INSERT INTO addons (user_id, blob, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at""",
+                (d["user_id"], seal(addons), updated_at),
+            )
+        return {"ok": True, "stored": True, "updatedAt": updated_at}
 
     def profile_of(request: Request) -> str:
         """Which profile a progress or My list call is for. Absent means the first one."""

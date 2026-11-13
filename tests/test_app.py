@@ -630,3 +630,103 @@ def test_progress_from_before_profiles_is_kept_as_main(tmp_path):
     c = sqlite3.connect(path)
     assert c.execute("SELECT profile, video_id, position FROM progress").fetchall() == [("main", "tt0133093", 12.5)]
     assert c.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == appmod.SCHEMA_VERSION
+
+
+# ------------------------------------------------------ settings and addons ----
+
+def test_settings_kept_per_kind_of_device_newest_wins(server, make_client, clock):
+    web, pc, tv = make_client(), make_client(), make_client()
+    sign_in(web)
+    hp, ht = bearer(link_device(web, pc, "PC")), bearer(link_device(web, tv, "TV"))
+    t0 = clock()
+
+    assert pc.get("/api/settings?device=desktop", headers=hp).json() == {"settings": None, "updatedAt": 0}
+    r = pc.put("/api/settings?device=desktop", headers=hp, json={"settings": {"posters": "tall", "n": 3}, "updatedAt": t0})
+    assert r.json() == {"ok": True, "stored": True, "updatedAt": t0}
+
+    # The TV's copy is its own; the same account's other PC would see the PC's.
+    assert tv.get("/api/settings?device=tv", headers=ht).json()["settings"] is None
+    assert tv.get("/api/settings?device=desktop", headers=ht).json() == {"settings": {"posters": "tall", "n": 3}, "updatedAt": t0}
+
+    # An older write loses and is told what's there.
+    r = tv.put("/api/settings?device=desktop", headers=ht, json={"settings": {"posters": "wide"}, "updatedAt": t0 - 5})
+    assert r.json() == {"ok": True, "stored": False, "updatedAt": t0}
+    assert pc.get("/api/settings?device=desktop", headers=hp).json()["settings"] == {"posters": "tall", "n": 3}
+
+    # A clock running ahead is held to the server's time.
+    clock.advance(10)
+    r = tv.put("/api/settings?device=tv", headers=ht, json={"settings": {"hdr": True}, "updatedAt": clock() + 10**9})
+    assert r.json()["updatedAt"] == clock()
+
+    # Not readable in the database.
+    raw = b"".join(bytes(r[0]) for r in db_rows(server, "SELECT blob FROM settings"))
+    assert b"tall" not in raw and b"hdr" not in raw
+
+
+def test_settings_validation(make_client, clock):
+    web, d = make_client(), make_client()
+    sign_in(web)
+    h = bearer(link_device(web, d))
+    assert d.get("/api/settings").status_code == 401
+    assert d.get("/api/settings?device=fridge", headers=h).status_code == 400
+    assert d.put("/api/settings", headers=h, json={"settings": [], "updatedAt": 1}).status_code == 400
+    assert d.put("/api/settings", headers=h, json={"settings": {}}).status_code == 400
+    assert d.put("/api/settings", headers=h, json={"settings": {}, "updatedAt": "now"}).status_code == 400
+    big = {"x": "y" * 300_000}
+    assert d.put("/api/settings", headers=h, json={"settings": big, "updatedAt": clock()}).status_code == 400
+
+
+def test_addons_follow_the_account_in_order(server, make_client, clock):
+    web, a, b, other = make_client(), make_client(), make_client(), make_client()
+    sign_in(web)
+    ha, hb = bearer(link_device(web, a, "PC")), bearer(link_device(web, b, "TV"))
+    t0 = clock()
+
+    assert a.get("/api/addons", headers=ha).json() == {"addons": None, "updatedAt": 0}
+    urls = ["https://one.example/manifest.json", "https://two.example/key=SECRET-VALUE/manifest.json"]
+    r = a.put("/api/addons", headers=ha, json={"addons": [{"url": u, "name": "dropped"} for u in urls + urls[:1]], "updatedAt": t0})
+    assert r.json() == {"ok": True, "stored": True, "updatedAt": t0}
+    assert b.get("/api/addons", headers=hb).json() == {"addons": [{"url": u} for u in urls], "updatedAt": t0}
+
+    # Newest wins, and an emptied list is a list.
+    assert b.put("/api/addons", headers=hb, json={"addons": [], "updatedAt": t0 - 1}).json()["stored"] is False
+    clock.advance(5)
+    assert b.put("/api/addons", headers=hb, json={"addons": [], "updatedAt": clock()}).json()["stored"] is True
+    assert a.get("/api/addons", headers=ha).json() == {"addons": [], "updatedAt": clock()}
+
+    # An address can carry its owner's keys: not readable in the database.
+    a.put("/api/addons", headers=ha, json={"addons": [{"url": urls[1]}], "updatedAt": clock()})
+    raw = b"".join(bytes(r[0]) for r in db_rows(server, "SELECT blob FROM addons"))
+    assert b"SECRET-VALUE" not in raw
+
+    # Someone else's account has its own.
+    sign_in(other, "someone-else")
+    ho = bearer(link_device(other, make_client()))
+    assert other.get("/api/addons", headers=ho).json()["addons"] is None
+
+
+def test_addons_validation(make_client, clock):
+    web, d = make_client(), make_client()
+    sign_in(web)
+    h = bearer(link_device(web, d))
+    t = clock()
+    assert d.get("/api/addons").status_code == 401
+    for bad in ({"url": "ftp://x.example/manifest.json"}, {"url": "https://x.example/a b"}, {"url": 5}, "https://x.example", {}):
+        assert d.put("/api/addons", headers=h, json={"addons": [bad], "updatedAt": t}).status_code == 400, bad
+    assert d.put("/api/addons", headers=h, json={"addons": {}, "updatedAt": t}).status_code == 400
+    assert d.put("/api/addons", headers=h, json={"addons": []}).status_code == 400
+    many = [{"url": f"https://x.example/{i}/manifest.json"} for i in range(61)]
+    assert d.put("/api/addons", headers=h, json={"addons": many, "updatedAt": t}).status_code == 400
+    assert d.put("/api/addons", headers=h, json={"addons": [{"url": "https://x.example/" + "a" * 2000}], "updatedAt": t}).status_code == 400
+
+
+def test_deleting_the_account_takes_settings_and_addons_with_it(server, make_client, clock):
+    web, d = make_client(), make_client()
+    sign_in(web)
+    h = bearer(link_device(web, d))
+    d.put("/api/settings", headers=h, json={"settings": {"a": 1}, "updatedAt": clock()})
+    d.put("/api/addons", headers=h, json={"addons": [{"url": "https://x.example/manifest.json"}], "updatedAt": clock()})
+    assert web.delete("/api/web/account", headers=CSRF).status_code == 200
+    with server.state.db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM addons").fetchone()[0] == 0

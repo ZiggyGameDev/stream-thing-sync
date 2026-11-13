@@ -8,6 +8,7 @@ app for Windows, Android phones and Android TV. It lets people:
 - keep their API keys (TorBox or Real-Debrid, MDBList, aioratings poster key)
   encrypted on the server so a new device picks them up automatically,
 - sync watch progress and My list between devices (this replaces Simkl in the app),
+- keep their settings and installed addons on the account, so every device has them,
 - manage their keys and signed-in devices, or delete their account, on the
   website.
 
@@ -45,12 +46,19 @@ rate-limited per client IP (shared budget, 10/minute).
 | POST | `/api/list` | `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "updatedAt"}}}`, or `{"removed": true, "updatedAt"}` to take one off → `{"ok": true, "now": ms}`. Same rules as progress: newest `updatedAt` wins, removals are kept so they reach other devices. ≤500 entries |
 | GET | `/api/profiles?since=ms` | `{"profiles": {"<id>": {"name", "color", "removed", "updatedAt"}}, "now": ms}` |
 | POST | `/api/profiles` | `{"profiles": {"<id>": {"name", "color", "removed"?, "updatedAt"}}}` → `{"ok": true, "now": ms}`. Newest wins. Ids `[a-z0-9-]{1,40}`, name 1–40 chars, color `#rrggbb`, ≤12 profiles. Removing one deletes its progress and list; `main` can't be removed |
+| GET | `/api/settings?device=tv\|phone\|desktop` | The app's settings for that kind of device: `{"settings": {...} \| null, "updatedAt": ms}`. A TV, a phone and a PC each keep their own copy |
+| PUT | `/api/settings?device=…` | `{"settings": {...}, "updatedAt": ms}` → `{"ok": true, "stored": bool, "updatedAt": ms}`. Newest `updatedAt` wins (ties go to the incoming write); `stored` is false when the server's copy is newer. ≤200 KB |
+| GET | `/api/addons` | The account's installed addons, in order: `{"addons": [{"url"}] \| null, "updatedAt": ms}`. Shared by every device and profile |
+| PUT | `/api/addons` | `{"addons": [{"url"}], "updatedAt": ms}` → as settings. The whole list is replaced. ≤60 addons, http(s) addresses ≤2000 chars |
 | POST | `/api/logout` | Revokes the calling token |
 
 **Profiles.** Progress and My list belong to a profile: add `?profile=<id>` to
 `/api/progress` and `/api/list` (GET and POST). Without it, the call is for `main`,
 which is also where everything synced before profiles existed lives. Keys are
 shared by every profile on the account.
+
+Settings and addons are encrypted at rest like the keys: an addon's address can
+carry its owner's own configuration.
 
 Credential keys: `debrid_service` (`"torbox"` or `"realdebrid"`), `torbox`
 (TorBox API key), `realdebrid` (Real-Debrid API token), `mdblist`, `poster`
