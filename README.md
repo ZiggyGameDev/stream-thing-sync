@@ -1,34 +1,112 @@
-# stream-thing-sync
+<div align="center">
 
-A small account and sync server for **stream-thing**, a Stremio-style streaming
-app for Windows, Android phones and Android TV. It lets people:
+<img src=".github/readme/banner.png" alt="stream-thing sync — your account, keys and watch history on every device" width="100%">
 
-- sign up / sign in with Google from inside the app (no passwords, no email
-  verification),
-- keep their API keys (TorBox or Real-Debrid, MDBList, aioratings poster key)
-  encrypted on the server so a new device picks them up automatically,
-- sync watch progress and My list between devices (this replaces Simkl in the app),
-- keep their settings and installed addons on the account, so every device has them,
-- manage their keys and signed-in devices, or delete their account, on the
-  website.
+<br>
 
-Live at <https://sync.thestoreisclosed.co.uk>. Python 3.12, FastAPI, SQLite —
-one file (`app.py`) and one page (`static/index.html`).
+[![Server status](https://img.shields.io/website?url=https%3A%2F%2Fsync.thestoreisclosed.co.uk%2Fhealthz&style=flat-square&label=sync.thestoreisclosed.co.uk&up_message=up&down_message=down&up_color=ff4d5e&labelColor=1a0f12)](https://sync.thestoreisclosed.co.uk)
+![Python 3.12](https://img.shields.io/badge/python-3.12-ff8a00?style=flat-square&logo=python&logoColor=white&labelColor=1a0f12)
+![FastAPI](https://img.shields.io/badge/FastAPI-ff6a4a?style=flat-square&logo=fastapi&logoColor=white&labelColor=1a0f12)
+![SQLite](https://img.shields.io/badge/SQLite-WAL-ff4d5e?style=flat-square&logo=sqlite&logoColor=white&labelColor=1a0f12)
+![Docker](https://img.shields.io/badge/Docker_Compose-ff2d78?style=flat-square&logo=docker&logoColor=white&labelColor=1a0f12)
+[![MIT](https://img.shields.io/badge/license-MIT-c9b8b4?style=flat-square&labelColor=1a0f12)](LICENSE)
 
-## API
+**The small account and sync server behind [stream-thing](https://ziggygamedev.github.io/stream-thing-releases/)** —<br>
+a Stremio-style streaming app for Windows, Android phones and Android TV.
 
-All JSON. Errors are `{"error": "..."}` with a meaningful status: 400 bad
-input, 401 bad/missing token or rejected Google credential, 403 missing CSRF
-header, 404, 429 rate-limited, 502 couldn't reach Google, 503 not configured.
+One file (`app.py`) · one page (`static/index.html`) · one SQLite database
 
-### In-app sign-in (returns a device token)
+[API](#-api) · [Security](#%EF%B8%8F-security) · [Configuration](#%EF%B8%8F-configuration) · [Run locally](#-run-locally) · [Deployment](#-deployment-cctv)
 
-Signing in is also signing up: the first sign-in with a Google account creates it.
+</div>
+
+<br>
+
+## ✨ What it does
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🔐 Sign in with Google
+From inside the app — no passwords, no email verification. The first sign-in creates the account.
+
+</td>
+<td width="50%" valign="top">
+
+### 🔑 Keys that travel
+TorBox or Real-Debrid, MDBList and the aioratings poster key, **encrypted** on the server so a new device picks them up automatically.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### ⏯️ Watch progress &amp; My list
+Synced between every device (this replaces Simkl in the app), per profile.
+
+</td>
+<td valign="top">
+
+### ⚙️ Settings &amp; addons
+Kept on the account, so every device has them — a TV, a phone and a PC each keep their own settings.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 📺 TVs sign in from a phone
+Through Google's own device flow, or a QR-code pairing on this server as the fallback.
+
+</td>
+<td valign="top">
+
+### 🧹 Manage it on the web
+Keys, signed-in devices, signing out and deleting the account, at [sync.thestoreisclosed.co.uk](https://sync.thestoreisclosed.co.uk).
+
+</td>
+</tr>
+</table>
+
+```mermaid
+flowchart LR
+    subgraph Devices
+        W["🪟 Windows"]
+        P["📱 Phone"]
+        T["📺 TV"]
+    end
+    W & P & T -- "Bearer token" --> S["app.py<br/>FastAPI"]
+    B["🌐 Website"] -- "session cookie" --> S
+    S <--> DB[("sync.db<br/>SQLite · WAL")]
+    S -- "verifies ID tokens" --> G["Google"]
+    CF["Cloudflare tunnel"] --> S
+```
+
+<br>
+
+## 📡 API
+
+All JSON. Errors are `{"error": "..."}` with a meaningful status:
+
+| Status | Meaning |
+|:---:|---|
+| `400` | bad input |
+| `401` | bad or missing token, or a rejected Google credential |
+| `403` | missing CSRF header |
+| `404` | not found |
+| `429` | rate-limited |
+| `502` | couldn't reach Google |
+| `503` | not configured |
+
+### In-app sign-in
+
+Returns a device token. Signing in is also signing up: the first sign-in with a Google account creates it.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/auth/google` | `{"id_token", "device_name"}` | **Android.** Credential Manager's Google ID token. Its audience may be any ID in `GOOGLE_CLIENT_IDS` (plus `GOOGLE_CLIENT_ID`, always) — Credential Manager tokens carry the *web* client ID |
-| POST | `/api/auth/google-code` | `{"code", "code_verifier", "redirect_uri", "device_name"}` | **Windows.** System-browser loopback flow with PKCE against the *desktop* client. The server exchanges the code at `https://oauth2.googleapis.com/token` with `GOOGLE_DESKTOP_CLIENT_ID` + `GOOGLE_DESKTOP_CLIENT_SECRET` and verifies the returned ID token (audience = desktop client). `redirect_uri` must be `http://127.0.0.1:<port>/...` or `http://localhost:<port>/...`; `code_verifier` 43–128 chars. 401 if Google rejects the code, 503 if the desktop secret isn't configured |
+| `POST` | `/api/auth/google` | `{"id_token", "device_name"}` | **Android.** Credential Manager's Google ID token. Its audience may be any ID in `GOOGLE_CLIENT_IDS` (plus `GOOGLE_CLIENT_ID`, always) — Credential Manager tokens carry the *web* client ID |
+| `POST` | `/api/auth/google-code` | `{"code", "code_verifier", "redirect_uri", "device_name"}` | **Windows.** System-browser loopback flow with PKCE against the *desktop* client. The server exchanges the code at `https://oauth2.googleapis.com/token` with `GOOGLE_DESKTOP_CLIENT_ID` + `GOOGLE_DESKTOP_CLIENT_SECRET` and verifies the returned ID token (audience = desktop client). `redirect_uri` must be `http://127.0.0.1:<port>/...` or `http://localhost:<port>/...`; `code_verifier` 43–128 chars. 401 if Google rejects the code, 503 if the desktop secret isn't configured |
 
 Both return `{"token": "<device token>", "account": {"email", "name"}}` and are
 rate-limited per client IP (shared budget, 10/minute).
@@ -37,89 +115,134 @@ rate-limited per client IP (shared budget, 10/minute).
 
 For a TV that can't run Google's sign-in itself (Fire TV has no Google services).
 
-**Through Google (preferred).** With `GOOGLE_TV_CLIENT_ID` and `GOOGLE_TV_CLIENT_SECRET` set (an
-OAuth client of type "TVs and Limited Input devices"), `GET /api/auth/tv/google` gives the TV
+<details>
+<summary><b>Through Google</b> (preferred)</summary>
+
+<br>
+
+With `GOOGLE_TV_CLIENT_ID` and `GOOGLE_TV_CLIENT_SECRET` set (an OAuth client of type
+"TVs and Limited Input devices"), `GET /api/auth/tv/google` gives the TV
 `{"client_id", "client_secret"}`. The TV runs Google's device flow itself: it asks Google
 for a code, shows `google.com/device` and the code, and waits on Google, not on this server.
 The ID token it ends with goes to `POST /api/auth/google`, which accepts that client as an
 audience. One request here per TV, however long the phone takes. 404 when not set up.
 
-**Through this server (fallback).** The TV asks for a pairing and shows its link as a QR code;
-a phone opens the link, signs in with Google on `/tv`, and the TV, asking every few seconds,
-is handed a device token of its own.
+</details>
+
+<details>
+<summary><b>Through this server</b> (fallback)</summary>
+
+<br>
+
+The TV asks for a pairing and shows its link as a QR code; a phone opens the link, signs in
+with Google on `/tv`, and the TV, asking every few seconds, is handed a device token of its own.
+
+```mermaid
+sequenceDiagram
+    participant TV
+    participant Server
+    participant Phone
+    TV->>Server: POST /api/auth/tv/start
+    Server-->>TV: pairing, user_code, url (QR)
+    Phone->>Server: GET /tv?c=ABCD-EFGH
+    Phone->>Server: POST /api/auth/tv/approve (Google ID token)
+    loop every few seconds
+        TV->>Server: POST /api/auth/tv/poll
+    end
+    Server-->>TV: device token (handed over once)
+```
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/auth/tv/start` | `{"device_name"}` | `{"pairing", "user_code", "url", "interval", "expires_in"}`. `pairing` is the TV's secret and never leaves it; `user_code` is 8 characters shown as `ABCD-EFGH`; `url` is `<PUBLIC_URL>/tv?c=<user_code>`. Pairings last 10 minutes. 20 per IP per 10 minutes |
-| POST | `/api/auth/tv/poll` | `{"pairing"}` | `{"status": "pending"}`, `{"status": "expired"}`, or once approved `{"token", "account": {"email", "name"}}`, handed over once: the pairing is then gone |
-| GET | `/tv?c=<user_code>` | | The phone's page: the code, and Google's sign-in button |
-| POST | `/api/auth/tv/approve` | `{"user_code", "id_token"}` | The page's call. The ID token is checked as the website's is (audience `GOOGLE_CLIENT_ID`), that Google account is signed in under the TV's device name, and the result waits for the TV's next poll. `{"ok": true, "device_name"}`. The code is matched ignoring case, spaces and the dash; 404 for a wrong or expired one, 429 after 10 wrong codes per IP per 10 minutes |
+| `POST` | `/api/auth/tv/start` | `{"device_name"}` | `{"pairing", "user_code", "url", "interval", "expires_in"}`. `pairing` is the TV's secret and never leaves it; `user_code` is 8 characters shown as `ABCD-EFGH`; `url` is `<PUBLIC_URL>/tv?c=<user_code>`. Pairings last 10 minutes. 20 per IP per 10 minutes |
+| `POST` | `/api/auth/tv/poll` | `{"pairing"}` | `{"status": "pending"}`, `{"status": "expired"}`, or once approved `{"token", "account": {"email", "name"}}`, handed over once: the pairing is then gone |
+| `GET` | `/tv?c=<user_code>` | | The phone's page: the code, and Google's sign-in button |
+| `POST` | `/api/auth/tv/approve` | `{"user_code", "id_token"}` | The page's call. The ID token is checked as the website's is (audience `GOOGLE_CLIENT_ID`), that Google account is signed in under the TV's device name, and the result waits for the TV's next poll. `{"ok": true, "device_name"}`. The code is matched ignoring case, spaces and the dash; 404 for a wrong or expired one, 429 after 10 wrong codes per IP per 10 minutes |
 
 Pairings are kept in memory: a restart drops any in progress and the TV shows a new code.
 
-### Device API (`Authorization: Bearer <token>`)
+</details>
+
+### Device API
+
+`Authorization: Bearer <token>`
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/me` | `{"email", "name", "device": {"id", "name"}}` |
-| GET | `/api/credentials` | `{"credentials": {...set keys only}, "updated_at": ms \| null}` |
-| PUT | `/api/credentials` | `{"credentials": {...}}` merge: string sets, `""`/`null` removes, unknown key → 400, max 512 chars. Returns the GET shape |
-| GET | `/api/progress?since=ms` | `{"progress": {"<videoId>": {"position", "duration", "watched", "updatedAt"}}, "now": ms}` |
-| POST | `/api/progress` | `{"progress": {"<videoId>": {...}}}` → `{"ok": true, "now": ms}`. Newest `updatedAt` wins (ties go to the incoming write). ≤500 entries, videoId ≤200 printable ASCII chars |
-| GET | `/api/list?since=ms` | My list: `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "removed", "updatedAt"}}, "now": ms}` |
-| POST | `/api/list` | `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "updatedAt"}}}`, or `{"removed": true, "updatedAt"}` to take one off → `{"ok": true, "now": ms}`. Same rules as progress: newest `updatedAt` wins, removals are kept so they reach other devices. ≤500 entries |
-| GET | `/api/profiles?since=ms` | `{"profiles": {"<id>": {"name", "color", "removed", "updatedAt"}}, "now": ms}` |
-| POST | `/api/profiles` | `{"profiles": {"<id>": {"name", "color", "removed"?, "updatedAt"}}}` → `{"ok": true, "now": ms}`. Newest wins. Ids `[a-z0-9-]{1,40}`, name 1–40 chars, color `#rrggbb`, ≤12 profiles. Removing one deletes its progress and list; `main` can't be removed |
-| GET | `/api/settings?device=tv\|phone\|desktop` | The app's settings for that kind of device: `{"settings": {...} \| null, "updatedAt": ms}`. A TV, a phone and a PC each keep their own copy |
-| PUT | `/api/settings?device=…` | `{"settings": {...}, "updatedAt": ms}` → `{"ok": true, "stored": bool, "updatedAt": ms}`. Newest `updatedAt` wins (ties go to the incoming write); `stored` is false when the server's copy is newer. ≤200 KB |
-| GET | `/api/addons` | The account's installed addons, in order: `{"addons": [{"url"}] \| null, "updatedAt": ms}`. Shared by every device and profile |
-| PUT | `/api/addons` | `{"addons": [{"url"}], "updatedAt": ms}` → as settings. The whole list is replaced. ≤60 addons, http(s) addresses ≤2000 chars |
-| POST | `/api/logout` | Revokes the calling token |
+| `GET` | `/api/me` | `{"email", "name", "device": {"id", "name"}}` |
+| `GET` | `/api/credentials` | `{"credentials": {...set keys only}, "updated_at": ms \| null}` |
+| `PUT` | `/api/credentials` | `{"credentials": {...}}` merge: string sets, `""`/`null` removes, unknown key → 400, max 512 chars. Returns the GET shape |
+| `GET` | `/api/progress?since=ms` | `{"progress": {"<videoId>": {"position", "duration", "watched", "updatedAt"}}, "now": ms}` |
+| `POST` | `/api/progress` | `{"progress": {"<videoId>": {...}}}` → `{"ok": true, "now": ms}`. Newest `updatedAt` wins (ties go to the incoming write). ≤500 entries, videoId ≤200 printable ASCII chars |
+| `GET` | `/api/list?since=ms` | My list: `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "removed", "updatedAt"}}, "now": ms}` |
+| `POST` | `/api/list` | `{"list": {"<titleId>": {"type", "name", "poster", "addedAt", "updatedAt"}}}`, or `{"removed": true, "updatedAt"}` to take one off → `{"ok": true, "now": ms}`. Same rules as progress: newest `updatedAt` wins, removals are kept so they reach other devices. ≤500 entries |
+| `GET` | `/api/profiles?since=ms` | `{"profiles": {"<id>": {"name", "color", "removed", "updatedAt"}}, "now": ms}` |
+| `POST` | `/api/profiles` | `{"profiles": {"<id>": {"name", "color", "removed"?, "updatedAt"}}}` → `{"ok": true, "now": ms}`. Newest wins. Ids `[a-z0-9-]{1,40}`, name 1–40 chars, color `#rrggbb`, ≤12 profiles. Removing one deletes its progress and list; `main` can't be removed |
+| `GET` | `/api/settings?device=tv\|phone\|desktop` | The app's settings for that kind of device: `{"settings": {...} \| null, "updatedAt": ms}`. A TV, a phone and a PC each keep their own copy |
+| `PUT` | `/api/settings?device=…` | `{"settings": {...}, "updatedAt": ms}` → `{"ok": true, "stored": bool, "updatedAt": ms}`. Newest `updatedAt` wins (ties go to the incoming write); `stored` is false when the server's copy is newer. ≤200 KB |
+| `GET` | `/api/addons` | The account's installed addons, in order: `{"addons": [{"url"}] \| null, "updatedAt": ms}`. Shared by every device and profile |
+| `PUT` | `/api/addons` | `{"addons": [{"url"}], "updatedAt": ms}` → as settings. The whole list is replaced. ≤60 addons, http(s) addresses ≤2000 chars |
+| `POST` | `/api/logout` | Revokes the calling token |
 
-**Profiles.** Progress and My list belong to a profile: add `?profile=<id>` to
-`/api/progress` and `/api/list` (GET and POST). Without it, the call is for `main`,
-which is also where everything synced before profiles existed lives. Keys are
-shared by every profile on the account.
+> [!TIP]
+> **Profiles.** Progress and My list belong to a profile: add `?profile=<id>` to
+> `/api/progress` and `/api/list` (GET and POST). Without it, the call is for `main`,
+> which is also where everything synced before profiles existed lives. Keys are
+> shared by every profile on the account.
 
 Settings and addons are encrypted at rest like the keys: an addon's address can
 carry its owner's own configuration.
 
-Credential keys: `debrid_service` (`"torbox"` or `"realdebrid"`), `torbox`
+**Credential keys:** `debrid_service` (`"torbox"` or `"realdebrid"`), `torbox`
 (TorBox API key), `realdebrid` (Real-Debrid API token), `mdblist`, `poster`
 (aioratings poster key).
 
-`since` semantics: pass back the `now` from your previous GET/POST. The server
-returns rows whose `changed_at` (its own clock when the row was last written)
-is `> since` — never compared with the device's `updatedAt` — so a device whose
-clock runs behind can't hide updates from the others. `now` is one millisecond
-behind the server clock so a write in the same millisecond as a pull isn't
-missed; an entry may occasionally come back twice, which is harmless with
-newest-wins merging. `updatedAt` decides which write wins; values in the future
-are clamped to server time.
+<details>
+<summary><b>How <code>since</code> works</b></summary>
 
-### Website API (session cookie; non-GET requests need `X-Requested-With: sync`)
+<br>
 
-The website is for managing the account; devices sign in from inside the app.
+Pass back the `now` from your previous GET/POST. The server returns rows whose
+`changed_at` (its own clock when the row was last written) is `> since` — never compared
+with the device's `updatedAt` — so a device whose clock runs behind can't hide updates
+from the others. `now` is one millisecond behind the server clock so a write in the same
+millisecond as a pull isn't missed; an entry may occasionally come back twice, which is
+harmless with newest-wins merging. `updatedAt` decides which write wins; values in the
+future are clamped to server time.
+
+</details>
+
+### Website API
+
+Session cookie; non-GET requests need `X-Requested-With: sync`. The website is for
+managing the account; devices sign in from inside the app.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/web/google` | `{"credential": "<Google ID token>"}` (audience: `GOOGLE_CLIENT_ID` only) → sets the session cookie (60 days) |
-| GET | `/api/web/me` | `{"email", "name", "picture"}` |
-| POST | `/api/web/logout` | |
-| GET/PUT | `/api/web/credentials` | Same shapes as the device API |
-| GET | `/api/web/devices` | `{"devices": [{"id", "name", "created_at", "last_used_at"}]}` |
-| DELETE | `/api/web/devices/{id}` | Signs that device out |
-| DELETE | `/api/web/account` | Deletes the user and everything belonging to them |
+| `POST` | `/api/web/google` | `{"credential": "<Google ID token>"}` (audience: `GOOGLE_CLIENT_ID` only) → sets the session cookie (60 days) |
+| `GET` | `/api/web/me` | `{"email", "name", "picture"}` |
+| `POST` | `/api/web/logout` | |
+| `GET` `PUT` | `/api/web/credentials` | Same shapes as the device API |
+| `GET` | `/api/web/devices` | `{"devices": [{"id", "name", "created_at", "last_used_at"}]}` |
+| `DELETE` | `/api/web/devices/{id}` | Signs that device out |
+| `DELETE` | `/api/web/account` | Deletes the user and everything belonging to them |
 
 Pages: `/` (account: keys, devices, sign out, delete), `/privacy`, `/terms`.
 `GET /healthz` → `{"ok": true}`.
 
-### App updates (public, read-only)
+### App updates
+
+Public, read-only.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET/HEAD | `/updates/latest.json` | The newest published build, served from `$DATA_DIR/updates/latest.json` with `Cache-Control: no-cache`. 404 `{"error": "no update published"}` if there is none, 503 if the file isn't valid JSON |
-| GET/HEAD | `/updates/files/<name>` | A build from `$DATA_DIR/updates/`. Only `.apk` (`application/vnd.android.package-archive`) and `.exe` (`application/octet-stream`); names are `[A-Za-z0-9][A-Za-z0-9._-]*`, nothing else (and no subdirectories) is reachable. Supports `Range` |
+| `GET` `HEAD` | `/updates/latest.json` | The newest published build, served from `$DATA_DIR/updates/latest.json` with `Cache-Control: no-cache`. 404 `{"error": "no update published"}` if there is none, 503 if the file isn't valid JSON |
+| `GET` `HEAD` | `/updates/files/<name>` | A build from `$DATA_DIR/updates/`. Only `.apk` (`application/vnd.android.package-archive`) and `.exe` (`application/octet-stream`); names are `[A-Za-z0-9][A-Za-z0-9._-]*`, nothing else (and no subdirectories) is reachable. Supports `Range` |
+
+<details>
+<summary><b>Example <code>latest.json</code></b></summary>
+
+<br>
 
 ```json
 {
@@ -134,43 +257,53 @@ Pages: `/` (account: keys, devices, sign out, delete), `/privacy`, `/terms`.
 }
 ```
 
+</details>
+
 URLs are relative to this server. The server never writes here: stream-thing's
 `scripts/publish-update.mjs` uploads the files with `scp` (to
 `/mnt/data/stream-thing-sync/updates/` on the box), then `latest.json` last, each
 renamed into place so a half-uploaded file is never served.
 
-## Security notes
+> [!NOTE]
+> New releases live on GitHub, in [stream-thing-releases](https://github.com/ZiggyGameDev/stream-thing-releases/releases).
+> `latest.json` is still copied here for copies of the app from before the move.
 
-- API keys are encrypted with Fernet (`SECRET_KEY`) before they touch the
-  database and decrypted only when served.
-- Device tokens (SHA-256) and session ids (HMAC keyed from `SECRET_KEY`) are
-  stored hashed.
-- The desktop client secret only ever comes from the environment; the Windows
-  app never sees it.
-- Tokens, keys, OAuth codes/verifiers and ID tokens are never logged; uvicorn's
-  access log is off and the app logs paths without query strings.
-- Sign-in endpoints are rate-limited per client IP (`CF-Connecting-IP`), in
-  memory.
-- The page is served with a nonce-based CSP that only allows Google's GIS
-  script.
+<br>
 
-## Configuration
+## 🛡️ Security
+
+- 🔒 API keys are encrypted with **Fernet** (`SECRET_KEY`) before they touch the database and decrypted only when served.
+- #️⃣ Device tokens (SHA-256) and session ids (HMAC keyed from `SECRET_KEY`) are **stored hashed**.
+- 🙈 The desktop client secret only ever comes from the environment; the Windows app never sees it.
+- 🤐 Tokens, keys, OAuth codes/verifiers and ID tokens are **never logged**; uvicorn's access log is off and the app logs paths without query strings.
+- 🚦 Sign-in endpoints are **rate-limited** per client IP (`CF-Connecting-IP`), in memory.
+- 🧱 The page is served with a **nonce-based CSP** that only allows Google's GIS script.
+
+<br>
+
+## ⚙️ Configuration
 
 | Variable | Required | Meaning |
-|---|---|---|
-| `GOOGLE_CLIENT_ID` | yes | OAuth **Web** client ID (public): `2461014992-1sq5ug6j943fr7kiflnehv5u2ckk1278.apps.googleusercontent.com`. Website sign-in, and always accepted by `/api/auth/google` |
-| `SECRET_KEY` | yes | Fernet key. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Changing it loses all saved API keys and signs everyone out of the website |
-| `GOOGLE_CLIENT_IDS` | no | Comma-separated extra audiences for `/api/auth/google`, e.g. the web and desktop IDs |
-| `GOOGLE_DESKTOP_CLIENT_ID` | for Windows | OAuth **Desktop** client ID (public): `2461014992-ikm313d2pkmpe8r4fe20rq88vis4dgha.apps.googleusercontent.com` |
-| `GOOGLE_DESKTOP_CLIENT_SECRET` | for Windows | **Secret.** Desktop client secret from Google Cloud Console; `.env` on the server only. Without it `/api/auth/google-code` returns 503 |
-| `PUBLIC_URL` | no | Default `https://sync.thestoreisclosed.co.uk`. Cookies are `Secure` when it's https |
-| `DATA_DIR` | no | Default `/data`; the database is `$DATA_DIR/sync.db` (WAL mode) |
+|---|:---:|---|
+| `GOOGLE_CLIENT_ID` | ✅ | OAuth **Web** client ID (public): `2461014992-1sq5ug6j943fr7kiflnehv5u2ckk1278.apps.googleusercontent.com`. Website sign-in, and always accepted by `/api/auth/google` |
+| `SECRET_KEY` | ✅ | Fernet key. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Changing it loses all saved API keys and signs everyone out of the website |
+| `GOOGLE_CLIENT_IDS` | | Comma-separated extra audiences for `/api/auth/google`, e.g. the web and desktop IDs |
+| `GOOGLE_DESKTOP_CLIENT_ID` | 🪟 | OAuth **Desktop** client ID (public): `2461014992-ikm313d2pkmpe8r4fe20rq88vis4dgha.apps.googleusercontent.com` |
+| `GOOGLE_DESKTOP_CLIENT_SECRET` | 🪟 | **Secret.** Desktop client secret from Google Cloud Console; `.env` on the server only. Without it `/api/auth/google-code` returns 503 |
+| `GOOGLE_TV_CLIENT_ID` / `GOOGLE_TV_CLIENT_SECRET` | 📺 | OAuth client of type "TVs and Limited Input devices", for TVs signing in through Google's device flow. Without them `/api/auth/tv/google` returns 404 and TVs pair through this server |
+| `PUBLIC_URL` | | Default `https://sync.thestoreisclosed.co.uk`. Cookies are `Secure` when it's https |
+| `DATA_DIR` | | Default `/data`; the database is `$DATA_DIR/sync.db` (WAL mode) |
 
-The server refuses to start without `GOOGLE_CLIENT_ID` and a valid `SECRET_KEY`.
-In Google Cloud Console the web OAuth client needs `https://sync.thestoreisclosed.co.uk`
-(and `http://localhost:8095` for local testing) under *Authorized JavaScript origins*.
+<sub>✅ required · 🪟 needed for Windows sign-in · 📺 needed for TVs to sign in through Google</sub>
 
-## Run locally
+> [!WARNING]
+> The server refuses to start without `GOOGLE_CLIENT_ID` and a valid `SECRET_KEY`.
+> In Google Cloud Console the web OAuth client needs `https://sync.thestoreisclosed.co.uk`
+> (and `http://localhost:8095` for local testing) under *Authorized JavaScript origins*.
+
+<br>
+
+## 💻 Run locally
 
 ```powershell
 py -3.12 -m venv .venv
@@ -182,16 +315,21 @@ $env:DATA_DIR = "./data"
 .venv\Scripts\uvicorn app:app --port 8095
 ```
 
-Tests: `.venv\Scripts\python -m pytest -q` (Google verification is faked).
+🧪 **Tests:** `.venv\Scripts\python -m pytest -q` (Google verification is faked).
 
-## Deployment (cctv)
+<br>
 
-Runs on the Debian box `cctv` beside cctv and buildbox, as its own compose
-project: `server` (this app) and `cloudflared` (its own tunnel). No host port is
-published publicly; the tunnel reaches `server:8095` over the compose network,
-and `127.0.0.1:8095` is exposed on the box for health checks.
+## 🚀 Deployment (cctv)
 
-First-time setup on the box:
+Runs on the Debian box `cctv` beside cctv and buildbox, as its own compose project:
+`server` (this app) and `cloudflared` (its own tunnel). No host port is published
+publicly; the tunnel reaches `server:8095` over the compose network, and
+`127.0.0.1:8095` is exposed on the box for health checks.
+
+<details>
+<summary><b>First-time setup on the box</b></summary>
+
+<br>
 
 ```sh
 git clone https://github.com/ZiggyGameDev/stream-thing-sync.git ~/stream-thing-sync
@@ -213,14 +351,26 @@ curl http://127.0.0.1:8095/healthz
 Make sure the credentials JSON is readable by the cloudflared container's user
 (e.g. `chmod 644`, the directory itself is mounted read-only).
 
-After that, deploy from Windows with `scripts/deploy.ps1`: it pushes `main` to
-GitHub, then on the box runs `git fetch && git reset --hard origin/main &&
-docker compose up -d --build` and checks `/healthz`.
+</details>
 
-Backups: the whole state is `/mnt/data/stream-thing-sync/sync.db` (plus `-wal`);
-`sqlite3 sync.db ".backup out.db"` gives a consistent copy. Keep `SECRET_KEY`
-with it, or the saved API keys can't be decrypted.
+**Deploying:** from Windows, `scripts/deploy.ps1` pushes `main` to GitHub, then on the box
+runs `git fetch && git reset --hard origin/main && docker compose up -d --build` and
+checks `/healthz`.
 
-## License
+**Backups:** the whole state is `/mnt/data/stream-thing-sync/sync.db` (plus `-wal`);
+`sqlite3 sync.db ".backup out.db"` gives a consistent copy.
+
+> [!CAUTION]
+> Keep `SECRET_KEY` with the backup, or the saved API keys can't be decrypted.
+
+<br>
+
+## 📄 License
 
 MIT — see [LICENSE](LICENSE).
+
+<br>
+
+<div align="center">
+<sub>Part of <a href="https://ziggygamedev.github.io/stream-thing-releases/">stream-thing</a> · made by <a href="https://github.com/ZiggyGameDev">ZiggyGameDev</a></sub>
+</div>
