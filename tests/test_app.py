@@ -5,8 +5,10 @@ from pathlib import Path
 import pytest
 
 import app as appmod
-from conftest import (CSRF, DESKTOP_ID, DESKTOP_SECRET, EXTRA_ID, REDIRECT, VERIFIER, app_sign_in, bearer,
-                      fake_token, link_device, make_settings, sign_in)
+from conftest import fake_verify as conftest_fake_verify
+from fastapi.testclient import TestClient
+from conftest import (CSRF, DESKTOP_ID, DESKTOP_SECRET, EXTRA_ID, REDIRECT, TV_ID, TV_SECRET, VERIFIER, app_sign_in,
+                      bearer, fake_token, link_device, make_settings, sign_in)
 
 
 def db_rows(server, sql, *args):
@@ -795,3 +797,18 @@ def test_tv_pairing_rejections(server, make_client, monkeypatch):
     t[0] += 601
     assert tv.post("/api/auth/tv/poll", json={"pairing": fresh["pairing"]}).json() == {"status": "expired"}
 
+
+def test_tv_signs_in_through_googles_device_flow(tmp_path, monkeypatch, client):
+    # Not set up: the TV is told so, and falls back to the pairing above.
+    assert client.get("/api/auth/tv/google").status_code == 404
+    assert client.post("/api/auth/google", json={"id_token": fake_token("alice", TV_ID), "device_name": "TV"}).status_code == 401
+
+    monkeypatch.setattr(appmod, "verify_google_token", conftest_fake_verify)
+    app = appmod.create_app(make_settings(tmp_path, tv_client_id=TV_ID, tv_client_secret=TV_SECRET))
+    tv = TestClient(app, base_url="https://testserver")
+    r = tv.get("/api/auth/tv/google")
+    assert r.json() == {"client_id": TV_ID, "client_secret": TV_SECRET}
+    assert r.headers["cache-control"] == "no-store"
+    # What Google hands the TV at the end is minted for the TV client, and is accepted.
+    r = tv.post("/api/auth/google", json={"id_token": fake_token("alice", TV_ID), "device_name": "Fire TV"})
+    assert r.status_code == 200 and r.json()["account"]["email"] == "alice@example.com"

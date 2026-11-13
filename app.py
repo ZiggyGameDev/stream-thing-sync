@@ -206,6 +206,10 @@ class Settings:
     google_client_ids: tuple[str, ...] = ()
     desktop_client_id: str = ""
     desktop_client_secret: str = ""
+    # The "TVs and Limited Input devices" client: a TV signs in through Google's own device
+    # flow with these, and its ID tokens are accepted by POST /api/auth/google.
+    tv_client_id: str = ""
+    tv_client_secret: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -220,11 +224,14 @@ class Settings:
             google_client_ids=_split_ids(os.environ.get("GOOGLE_CLIENT_IDS", "")),
             desktop_client_id=os.environ.get("GOOGLE_DESKTOP_CLIENT_ID", "").strip(),
             desktop_client_secret=os.environ.get("GOOGLE_DESKTOP_CLIENT_SECRET", "").strip(),
+            tv_client_id=os.environ.get("GOOGLE_TV_CLIENT_ID", "").strip(),
+            tv_client_secret=os.environ.get("GOOGLE_TV_CLIENT_SECRET", "").strip(),
         )
 
     @property
     def app_audiences(self) -> list[str]:
-        return list(dict.fromkeys((self.google_client_id,) + tuple(self.google_client_ids)))
+        tv = (self.tv_client_id,) if self.tv_client_id else ()
+        return list(dict.fromkeys((self.google_client_id,) + tuple(self.google_client_ids) + tv))
 
     @property
     def secure_cookies(self) -> bool:
@@ -775,6 +782,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # --- device API ---
 
     # --- signing a TV in from a phone ---
+    tv_start_limiter = TokenBucket(capacity=20, per_seconds=600)    # per IP
     #
     # A TV with no Google services (Fire TV) can't run "Sign in with Google". It asks for a
     # pairing and shows its link as a QR code; a phone opens the link, signs in with Google
@@ -783,10 +791,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # phone approve it. Pairings live in memory: a restart drops any in progress and the TV
     # shows a fresh code.
 
+    @app.get("/api/auth/tv/google")
+    async def tv_google(request: Request):
+        """What a TV needs to sign in through Google's own device flow (google.com/device):
+        it asks Google for a code and waits on Google, not on this server, then brings the
+        ID token to /api/auth/google. Google does not treat this kind of client's secret as
+        confidential (it would otherwise ship inside the app); kept here so it can be
+        changed without a new build. 404 when not set up: the TV uses the pairing below."""
+        if not tv_start_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        if not (settings.tv_client_id and settings.tv_client_secret):
+            raise ApiError(404, "not found")
+        return JSONResponse({"client_id": settings.tv_client_id, "client_secret": settings.tv_client_secret},
+                            headers={"Cache-Control": "no-store"})
+
     tv_lock = threading.Lock()
     tv_pairings: dict[str, dict] = {}   # pairing -> {code, device_name, expires, result}
     tv_codes: dict[str, str] = {}       # code -> pairing
-    tv_start_limiter = TokenBucket(capacity=20, per_seconds=600)    # per IP
     tv_approve_limiter = TokenBucket(capacity=10, per_seconds=600)  # wrong codes, per IP
 
     def tv_sweep():

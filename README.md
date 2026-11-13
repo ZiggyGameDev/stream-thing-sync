@@ -35,9 +35,18 @@ rate-limited per client IP (shared budget, 10/minute).
 
 ### Signing a TV in from a phone
 
-For a TV that can't run Google's sign-in itself (Fire TV has no Google services). The TV
-asks for a pairing and shows its link as a QR code; a phone opens the link, signs in with
-Google on `/tv`, and the TV, asking every few seconds, is handed a device token of its own.
+For a TV that can't run Google's sign-in itself (Fire TV has no Google services).
+
+**Through Google (preferred).** With `GOOGLE_TV_CLIENT_ID` and `GOOGLE_TV_CLIENT_SECRET` set (an
+OAuth client of type "TVs and Limited Input devices"), `GET /api/auth/tv/google` gives the TV
+`{"client_id", "client_secret"}`. The TV runs Google's device flow itself: it asks Google
+for a code, shows `google.com/device` and the code, and waits on Google, not on this server.
+The ID token it ends with goes to `POST /api/auth/google`, which accepts that client as an
+audience. One request here per TV, however long the phone takes. 404 when not set up.
+
+**Through this server (fallback).** The TV asks for a pairing and shows its link as a QR code;
+a phone opens the link, signs in with Google on `/tv`, and the TV, asking every few seconds,
+is handed a device token of its own.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
