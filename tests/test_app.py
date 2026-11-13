@@ -730,3 +730,68 @@ def test_deleting_the_account_takes_settings_and_addons_with_it(server, make_cli
     with server.state.db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM addons").fetchone()[0] == 0
+
+
+# ------------------------------------------------- signing a TV in from a phone ----
+
+def test_tv_signs_in_from_a_phone(server, make_client):
+    tv, phone = make_client(), make_client()
+    r = tv.post("/api/auth/tv/start", json={"device_name": "Fire TV"})
+    assert r.status_code == 200
+    start = r.json()
+    assert re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", start["user_code"])
+    assert start["url"] == f"https://sync.example.test/tv?c={start['user_code']}"
+    assert start["interval"] == 4 and start["expires_in"] == 600 and len(start["pairing"]) >= 40
+
+    assert tv.post("/api/auth/tv/poll", json={"pairing": start["pairing"]}).json() == {"status": "pending"}
+
+    # The phone's page, with the code filled in and nothing else injectable.
+    page = phone.get("/tv", params={"c": start["user_code"]})
+    assert page.status_code == 200 and start["user_code"] in page.text
+    assert "nonce-" in page.headers["content-security-policy"]
+    assert "<script>" not in phone.get("/tv", params={"c": '"><script>alert(1)</script>'}).text
+
+    # The code is matched whatever its case, spacing or dash.
+    sloppy = start["user_code"].replace("-", " ").lower()
+    r = phone.post("/api/auth/tv/approve", json={"user_code": sloppy, "id_token": fake_token("alice")})
+    assert r.json() == {"ok": True, "device_name": "Fire TV"}
+
+    done = tv.post("/api/auth/tv/poll", json={"pairing": start["pairing"]}).json()
+    assert done["account"] == {"email": "alice@example.com", "name": "Alice"}
+    me = tv.get("/api/me", headers=bearer(done["token"])).json()
+    assert me["email"] == "alice@example.com" and me["device"]["name"] == "Fire TV"
+
+    # Handed over once.
+    assert tv.post("/api/auth/tv/poll", json={"pairing": start["pairing"]}).json() == {"status": "expired"}
+    assert phone.post("/api/auth/tv/approve", json={"user_code": start["user_code"], "id_token": fake_token("alice")}).status_code == 404
+
+
+def test_tv_pairing_rejections(server, make_client, monkeypatch):
+    tv, phone = make_client(), make_client()
+    start = tv.post("/api/auth/tv/start", json={"device_name": "TV"}).json()
+
+    # A bad Google credential signs nobody in, and the TV keeps waiting.
+    r = phone.post("/api/auth/tv/approve", json={"user_code": start["user_code"], "id_token": "garbage"})
+    assert r.status_code == 401
+    assert tv.post("/api/auth/tv/poll", json={"pairing": start["pairing"]}).json() == {"status": "pending"}
+
+    # A token minted for some other app is refused: only the website's own client.
+    r = phone.post("/api/auth/tv/approve", json={"user_code": start["user_code"], "id_token": fake_token("alice", EXTRA_ID)})
+    assert r.status_code == 401
+
+    # Unknown pairings and codes.
+    assert tv.post("/api/auth/tv/poll", json={"pairing": "nope"}).json() == {"status": "expired"}
+    assert tv.post("/api/auth/tv/poll", json={}).json() == {"status": "expired"}
+    assert phone.post("/api/auth/tv/approve", json={"user_code": "AAAA-AAAA", "id_token": fake_token("alice")}).status_code == 404
+
+    # Guessing codes runs out.
+    codes = [phone.post("/api/auth/tv/approve", json={"user_code": "ZZZZ-ZZZZ", "id_token": fake_token("alice")}).status_code for _ in range(12)]
+    assert codes[-1] == 429
+
+    # Ten minutes on, the pairing is gone.
+    t = [appmod.monotonic()]
+    monkeypatch.setattr(appmod, "monotonic", lambda: t[0])
+    fresh = tv.post("/api/auth/tv/start", json={"device_name": "TV"}).json()
+    t[0] += 601
+    assert tv.post("/api/auth/tv/poll", json={"pairing": fresh["pairing"]}).json() == {"status": "expired"}
+

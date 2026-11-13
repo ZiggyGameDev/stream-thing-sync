@@ -33,6 +33,21 @@ Signing in is also signing up: the first sign-in with a Google account creates i
 Both return `{"token": "<device token>", "account": {"email", "name"}}` and are
 rate-limited per client IP (shared budget, 10/minute).
 
+### Signing a TV in from a phone
+
+For a TV that can't run Google's sign-in itself (Fire TV has no Google services). The TV
+asks for a pairing and shows its link as a QR code; a phone opens the link, signs in with
+Google on `/tv`, and the TV, asking every few seconds, is handed a device token of its own.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/api/auth/tv/start` | `{"device_name"}` | `{"pairing", "user_code", "url", "interval", "expires_in"}`. `pairing` is the TV's secret and never leaves it; `user_code` is 8 characters shown as `ABCD-EFGH`; `url` is `<PUBLIC_URL>/tv?c=<user_code>`. Pairings last 10 minutes. 20 per IP per 10 minutes |
+| POST | `/api/auth/tv/poll` | `{"pairing"}` | `{"status": "pending"}`, `{"status": "expired"}`, or once approved `{"token", "account": {"email", "name"}}`, handed over once: the pairing is then gone |
+| GET | `/tv?c=<user_code>` | | The phone's page: the code, and Google's sign-in button |
+| POST | `/api/auth/tv/approve` | `{"user_code", "id_token"}` | The page's call. The ID token is checked as the website's is (audience `GOOGLE_CLIENT_ID`), that Google account is signed in under the TV's device name, and the result waits for the TV's next poll. `{"ok": true, "device_name"}`. The code is matched ignoring case, spaces and the dash; 404 for a wrong or expired one, 429 after 10 wrong codes per IP per 10 minutes |
+
+Pairings are kept in memory: a restart drops any in progress and the TV shows a new code.
+
 ### Device API (`Authorization: Bearer <token>`)
 
 | Method | Path | Notes |

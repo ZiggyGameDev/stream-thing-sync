@@ -56,6 +56,12 @@ MAX_PROFILES = 12
 PROFILE_ID_RE = re.compile(r"^[a-z0-9-]{1,40}$")
 PROFILE_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_DEVICE_NAME_LEN = 80
+# Signing a TV in from a phone: the TV shows a code, a phone approves it with Google.
+TV_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+TV_CODE_LEN = 8
+TV_PAIRING_TTL_S = 600
+TV_POLL_INTERVAL_S = 4
+TV_MAX_PAIRINGS = 5000
 DEVICE_KINDS = ("tv", "phone", "desktop")
 MAX_SETTINGS_BYTES = 200_000
 MAX_ADDONS = 60
@@ -456,6 +462,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     session_key = hashlib.sha256(b"stream-thing-sync/session/" + settings.secret_key.encode()).digest()
     db = Database(Path(settings.data_dir) / "sync.db")
     page_template = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    tv_template = (STATIC_DIR / "tv.html").read_text(encoding="utf-8")
     # A JS string literal that can't close the <script> element.
     client_id_json = json.dumps(settings.google_client_id).replace("<", "\\u003c").replace(">", "\\u003e")
 
@@ -766,6 +773,116 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return sign_in_device(info, name)
 
     # --- device API ---
+
+    # --- signing a TV in from a phone ---
+    #
+    # A TV with no Google services (Fire TV) can't run "Sign in with Google". It asks for a
+    # pairing and shows its link as a QR code; a phone opens the link, signs in with Google
+    # on /tv, and the TV, asking every few seconds, picks up a device token of its own. The
+    # pairing is the TV's secret and never leaves it; the short code in the link only lets a
+    # phone approve it. Pairings live in memory: a restart drops any in progress and the TV
+    # shows a fresh code.
+
+    tv_lock = threading.Lock()
+    tv_pairings: dict[str, dict] = {}   # pairing -> {code, device_name, expires, result}
+    tv_codes: dict[str, str] = {}       # code -> pairing
+    tv_start_limiter = TokenBucket(capacity=20, per_seconds=600)    # per IP
+    tv_approve_limiter = TokenBucket(capacity=10, per_seconds=600)  # wrong codes, per IP
+
+    def tv_sweep():
+        t = monotonic()
+        for pairing in [p for p, e in tv_pairings.items() if e["expires"] < t]:
+            tv_codes.pop(tv_pairings.pop(pairing)["code"], None)
+
+    def tv_pretty(code: str) -> str:
+        return f"{code[:4]}-{code[4:]}"
+
+    def tv_norm(code) -> str:
+        return re.sub(r"[^A-Z0-9]", "", str(code or "").upper())
+
+    @app.post("/api/auth/tv/start")
+    async def tv_start(request: Request):
+        if not tv_start_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many requests")
+        body = await read_json(request)
+        name = device_name_from(body)
+        with tv_lock:
+            tv_sweep()
+            if len(tv_pairings) >= TV_MAX_PAIRINGS:
+                raise ApiError(503, "too many TVs are signing in, try again in a minute")
+            pairing = secrets.token_urlsafe(32)
+            while True:
+                code = "".join(secrets.choice(TV_CODE_ALPHABET) for _ in range(TV_CODE_LEN))
+                if code not in tv_codes:
+                    break
+            tv_pairings[pairing] = {"code": code, "device_name": name, "expires": monotonic() + TV_PAIRING_TTL_S, "result": None}
+            tv_codes[code] = pairing
+        return {"pairing": pairing, "user_code": tv_pretty(code),
+                "url": f"{settings.public_url.rstrip('/')}/tv?c={tv_pretty(code)}",
+                "interval": TV_POLL_INTERVAL_S, "expires_in": TV_PAIRING_TTL_S}
+
+    @app.post("/api/auth/tv/poll")
+    async def tv_poll(request: Request):
+        body = await read_json(request)
+        pairing = body.get("pairing")
+        with tv_lock:
+            entry = tv_pairings.get(pairing) if isinstance(pairing, str) else None
+            if entry is None or entry["expires"] < monotonic():
+                return {"status": "expired"}
+            if entry["result"] is None:
+                return {"status": "pending"}
+            # Handed over once: the pairing is gone after this.
+            tv_pairings.pop(pairing, None)
+            tv_codes.pop(entry["code"], None)
+            return entry["result"]
+
+    @app.post("/api/auth/tv/approve")
+    async def tv_approve(request: Request):
+        ip = client_ip(request)
+        body = await read_json(request)
+        code = tv_norm(body.get("user_code"))
+        with tv_lock:
+            pairing = tv_codes.get(code)
+            entry = tv_pairings.get(pairing) if pairing else None
+            if entry is not None and entry["expires"] < monotonic():
+                entry = None
+        if entry is None:
+            if not tv_approve_limiter.allow(ip):
+                raise ApiError(429, "Too many tries. Wait a few minutes.")
+            raise ApiError(404, "That code is wrong or has expired. Check the TV for a new one.")
+        if entry["result"] is not None:
+            return {"ok": True, "device_name": entry["device_name"]}
+        # The page's Google button mints the token for the web client, as the website's does.
+        info = await verify_identity(body.get("id_token"), settings.google_client_id)
+        result = sign_in_device(info, entry["device_name"])
+        with tv_lock:
+            if tv_pairings.get(pairing) is entry and entry["result"] is None:
+                entry["result"] = result
+        return {"ok": True, "device_name": entry["device_name"]}
+
+    @app.get("/tv", include_in_schema=False)
+    async def tv_page(c: str = ""):
+        nonce = secrets.token_urlsafe(16)
+        code = re.sub(r"[^A-Za-z0-9-]", "", c)[:16].upper()
+        body = (tv_template.replace("{{CLIENT_ID_JSON}}", client_id_json)
+                .replace("{{NONCE}}", nonce).replace("{{CODE}}", code))
+        csp = "; ".join([
+            "default-src 'self'",
+            f"script-src 'nonce-{nonce}' https://accounts.google.com/gsi/client",
+            "style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style",
+            "frame-src https://accounts.google.com/gsi/",
+            "connect-src 'self' https://accounts.google.com/gsi/",
+            "img-src 'self' data: https://*.googleusercontent.com",
+            "base-uri 'none'",
+            "form-action 'self'",
+            "frame-ancestors 'none'",
+        ])
+        return HTMLResponse(body, headers={
+            "Content-Security-Policy": csp,
+            "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
+            "Cache-Control": "no-store",
+            "Referrer-Policy": "no-referrer",
+        })
 
     @app.get("/api/me")
     async def me(request: Request):
