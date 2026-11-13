@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -497,6 +498,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _unexpected(request: Request, exc: Exception):
         log.exception("unhandled error on %s %s", request.method, request.url.path)
         return JSONResponse({"error": "internal error"}, status_code=500)
+
+    # The app on a Samsung TV running it through TizenBrew is a page on another site (the
+    # downloads site), and a browser only lets such a page read an answer that says it may.
+    # Any site may ask, but only as the app does: with its own token in the Authorization
+    # header. Cookies are never sent this way and X-Requested-With is not allowed, so the
+    # website's own API (cookie session) stays closed to other sites.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["authorization", "content-type", "accept"],
+        max_age=600,
+    )
 
     @app.middleware("http")
     async def _headers_and_log(request: Request, call_next):

@@ -32,6 +32,20 @@ def test_healthz_and_pages(client):
     assert "inside the stream-thing app" in r.text
 
 
+def test_a_page_on_another_site_may_call_as_the_app_does(client):
+    origin = {"Origin": "https://ziggygamedev.github.io"}
+    ask = client.options("/api/progress", headers={**origin, "Access-Control-Request-Method": "POST",
+                                                   "Access-Control-Request-Headers": "authorization,content-type"})
+    assert ask.status_code == 200 and ask.headers["access-control-allow-origin"] == "*"
+    r = client.get("/api/progress", headers=origin)
+    assert r.status_code == 401 and r.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-credentials" not in r.headers
+    # The website's API is called with a cookie and X-Requested-With, which another site may not send.
+    refused = client.options("/api/web/me", headers={**origin, "Access-Control-Request-Method": "POST",
+                                                     "Access-Control-Request-Headers": "x-requested-with"})
+    assert refused.status_code == 400
+
+
 def test_device_code_flow_is_gone(client):
     assert client.get("/link").status_code == 404
     for path in ("/api/link/start", "/api/link/poll", "/api/web/link/approve"):
