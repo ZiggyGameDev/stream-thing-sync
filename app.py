@@ -92,11 +92,6 @@ PARTY_SYNC_GRACE_S = 10.0
 PARTY_START_LEAD_MS = 200
 # A poll with ?v= waits up to this long for something to change (a long poll).
 PARTY_WAIT_S = 20.0
-# Reels shared into a party: queued, and played on the party's TV (resolve_reel).
-PARTY_REELS_MAX = 30
-PARTY_REEL_CAPTION_LEN = 200
-REEL_CACHE_S = 20 * 60
-REEL_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?instagram\.com/(?:[A-Za-z0-9_.]+/)?(?:reels?|p|tv)/([A-Za-z0-9_-]{5,40})")
 REPORT_MESSAGE_LEN = 4000
 REPORT_LOG_LEN = 300_000
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -466,55 +461,6 @@ def check_number(value, what: str):
 # --- app ---------------------------------------------------------------------
 
 
-class ReelError(Exception):
-    """A reel that can't be played: private, removed, not a video, or Instagram said no."""
-
-
-def reel_shortcode(text) -> str | None:
-    """The reel's id in an Instagram link (reel, post or IGTV, with or without tracking bits)."""
-    if not isinstance(text, str):
-        return None
-    m = REEL_RE.search(text.strip()[:2000])
-    return m.group(1) if m else None
-
-
-def resolve_reel(shortcode: str) -> dict:
-    """What a public reel is and a link to its video file, through yt-dlp (no login).
-
-    Instagram serves each reel as a few single files with picture and sound together
-    (formats not named dash-...), and as DASH pieces with them apart; a <video> on a TV plays
-    the single file, so the biggest of those is the one. Its link is signed and lasts some
-    hours, so callers cache it for a while rather than keep it.
-    """
-    import yt_dlp  # here: only the reel routes need it, and it is slow to load
-
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "socket_timeout": 15, "extractor_retries": 1,
-            "cachedir": False}  # the container's disk is read-only
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"https://www.instagram.com/reel/{shortcode}/", download=False)
-    except Exception as e:  # yt-dlp's DownloadError/ExtractorError family
-        raise ReelError(str(e).splitlines()[0][:200] if str(e) else type(e).__name__) from e
-    if info.get("_type") == "playlist":  # a carousel post: its first video
-        info = next((e for e in info.get("entries") or [] if e and e.get("formats")), None) or {}
-    whole = [f for f in info.get("formats") or []
-             if f.get("url") and not str(f.get("format_id", "")).startswith("dash")
-             and f.get("vcodec") != "none"]
-    if not whole:
-        raise ReelError("no playable video in that post")
-    best = max(whole, key=lambda f: ((f.get("height") or 0) * (f.get("width") or 0), f.get("tbr") or 0))
-    caption = " ".join(str(info.get("description") or info.get("title") or "").split())
-    duration = info.get("duration")
-    return {
-        "video": best["url"],
-        "thumb": info.get("thumbnail") or "",
-        "author": str(info.get("channel") or info.get("uploader_id") or info.get("uploader") or "")[:60],
-        "caption": caption[:PARTY_REEL_CAPTION_LEN],
-        "duration": duration if isinstance(duration, (int, float)) else None,
-    }
-
-
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     try:
@@ -557,13 +503,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # downloads site), and a browser only lets such a page read an answer that says it may.
     # Any site may ask, but only as the app does: with its own token in the Authorization
     # header. Cookies are never sent this way and X-Requested-With is not allowed, so the
-    # website's own API (cookie session) stays closed to other sites. A watch party's member
-    # token (x-party-token) is the same kind of thing: a header the app sends, not a cookie.
+    # website's own API (cookie session) stays closed to other sites.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE"],
+        # x-party-token: a watch party member's pass, sent by the Samsung/LG TV page (another site).
         allow_headers=["authorization", "content-type", "accept", "x-party-token"],
         max_age=600,
     )
@@ -1451,23 +1397,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     party_join_limiter = TokenBucket(capacity=30, per_seconds=600)
     party_poll_limiter = TokenBucket(capacity=600, per_seconds=60)
     party_chat_limiter = TokenBucket(capacity=20, per_seconds=60)
-    party_reel_limiter = TokenBucket(capacity=15, per_seconds=60)
-    # shortcode -> (monotonic time it was looked up, what resolve_reel said). Shared by every
-    # party: the same reel sent to two parties is looked up once.
-    reel_cache: dict[str, tuple[float, dict]] = {}
-    reel_cache_lock = threading.Lock()
-
-    async def reel_info(shortcode: str, fresh: bool = False) -> dict:
-        with reel_cache_lock:
-            hit = reel_cache.get(shortcode)
-            if hit and not fresh and monotonic() - hit[0] < REEL_CACHE_S:
-                return hit[1]
-        info = await run_in_threadpool(resolve_reel, shortcode)
-        with reel_cache_lock:
-            for old in [c for c, (t, _) in reel_cache.items() if monotonic() - t >= REEL_CACHE_S]:
-                del reel_cache[old]
-            reel_cache[shortcode] = (monotonic(), info)
-        return info
 
     # code -> an event set (and replaced) whenever that party changes: long polls wait on it.
     party_events: dict[str, asyncio.Event] = {}
@@ -1614,9 +1543,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "sync": party_sync_view(party),
             "media": party["media"],
             "playback": party["playback"],
-            # The queue, the one playing first. No video link: it is signed and expires, so
-            # the screen about to play one asks for a fresh link (/reels/{id}/play).
-            "reels": party.get("reels", []),
             "now": now_ms(),
         }
 
@@ -1664,7 +1590,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise ApiError(503, "could not make a code, try again")
             party = {"code": code, "version": 0, "host": "", "members": {}, "media": None,
                      "playback": None, "chat": [], "chat_seq": 0, "sync": None, "sync_seq": 0,
-                     "reels": [], "reel_seq": 0,
                      "touched": monotonic()}
             member_id, token = party_add(party, party_name(body), party_avatar(body.get("avatar")))
             party["host"] = member_id
@@ -1813,67 +1738,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not party["members"]:
                 parties.pop(party["code"], None)
         return {"ok": True}
-
-    @app.post("/api/party/{code}/reels")
-    async def party_reel_add(code: str, request: Request):
-        """Someone shared a reel: it joins the end of the queue the party's TV plays."""
-        body = await read_json(request)
-        shortcode = reel_shortcode(body.get("url"))
-        if not shortcode:
-            raise ApiError(400, "that isn't a link to an Instagram reel")
-        with parties_lock:
-            party, member_id = party_member(code, request)
-            if not party_reel_limiter.allow(party["code"] + ":" + member_id):
-                raise ApiError(429, "slow down")
-            if any(r["code"] == shortcode for r in party["reels"]):
-                raise ApiError(409, "that reel is already in the queue")
-            if len(party["reels"]) >= PARTY_REELS_MAX:
-                raise ApiError(409, "the queue is full")
-        # Looked up outside the lock: it is a request to Instagram, a second or two.
-        try:
-            info = await reel_info(shortcode)
-        except ReelError as e:
-            log.info("reel %s could not be resolved: %s", shortcode, e)
-            raise ApiError(422, "Instagram wouldn't give that reel (it may be private or removed)")
-        with parties_lock:
-            party, member_id = party_member(code, request)
-            if not any(r["code"] == shortcode for r in party["reels"]) and len(party["reels"]) < PARTY_REELS_MAX:
-                party["reel_seq"] += 1
-                party["reels"].append({
-                    "id": party["reel_seq"], "code": shortcode, "by": member_id,
-                    "name": party["members"][member_id]["name"], "author": info["author"],
-                    "caption": info["caption"], "thumb": info["thumb"], "duration": info["duration"],
-                    "at": now_ms(),
-                })
-                party_bump(party)
-            return party_view(party, member_id)
-
-    @app.get("/api/party/{code}/reels/{reel_id}/play")
-    async def party_reel_play(code: str, reel_id: int, request: Request):
-        """A link to a queued reel's video, for the screen about to play it (?fresh=1: look
-        it up again, when the cached link has stopped working)."""
-        with parties_lock:
-            party, _ = party_member(code, request)
-            reel = next((r for r in party["reels"] if r["id"] == reel_id), None)
-            if reel is None:
-                raise ApiError(404, "that reel isn't in the queue")
-            shortcode = reel["code"]
-        try:
-            info = await reel_info(shortcode, fresh=request.query_params.get("fresh") == "1")
-        except ReelError:
-            raise ApiError(422, "Instagram wouldn't give that reel any more")
-        return {"id": reel_id, "video": info["video"]}
-
-    @app.post("/api/party/{code}/reels/{reel_id}/remove")
-    async def party_reel_remove(code: str, reel_id: int, request: Request):
-        """Off the queue: it finished playing, someone skipped it, or took it off. Anyone can."""
-        with parties_lock:
-            party, member_id = party_member(code, request)
-            before = len(party["reels"])
-            party["reels"] = [r for r in party["reels"] if r["id"] != reel_id]
-            if len(party["reels"]) != before:
-                party_bump(party)
-            return party_view(party, member_id)
 
     # --- problem reports ---
     #
