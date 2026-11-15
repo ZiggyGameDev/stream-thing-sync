@@ -3,3 +3,4 @@ uvicorn==0.54.0
 google-auth==2.62.0
 cryptography==50.0.2
 requests==2.34.2
+yt-dlp==2026.10.26
