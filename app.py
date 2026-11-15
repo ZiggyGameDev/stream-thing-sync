@@ -489,7 +489,8 @@ def resolve_reel(shortcode: str) -> dict:
     import yt_dlp  # here: only the reel routes need it, and it is slow to load
 
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "socket_timeout": 15, "extractor_retries": 1}
+            "socket_timeout": 15, "extractor_retries": 1,
+            "cachedir": False}  # the container's disk is read-only
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"https://www.instagram.com/reel/{shortcode}/", download=False)
