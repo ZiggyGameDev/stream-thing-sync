@@ -234,6 +234,34 @@ managing the account; devices sign in from inside the app.
 Pages: `/` (account: keys, devices, sign out, delete), `/privacy`, `/terms`.
 `GET /healthz` → `{"ok": true}`.
 
+### Bug reports (public)
+
+The bug button in the app. No sign-in needed; with a device token, the account is noted on
+the report.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/api/report` | `{"message"?, "screenshot"?, "version"?, "platform"?, "device"?, "page"?, "info"?, "playback"?, "logs"?, "diagnostics"?}` | → `{"id"}`. Needs a `message` or a `screenshot`. `screenshot` is a JPEG or PNG as base64 or a `data:` address, ≤3 MB (one that can't be read is left out, the report still arrives); `info` is an object of short plain values; `playback` is what was playing and how (≤100 KB), with `findings`, a list of plain sentences that head the issue; `logs` an object of texts. Body ≤6 MB. 6 per IP per hour |
+| GET/HEAD | `/reports/shots/<name>` | | A report's screenshot. The name ends in 32 random characters and is only ever written into the issue filed from the report |
+
+Each report is one file, `$DATA_DIR/reports/<id>.json`, with its screenshot in
+`reports/shots/`.
+
+**Reports become GitHub issues** when `GITHUB_TOKEN` and `GITHUB_REPO` are set. Within
+moments of a report arriving, an issue is opened on that repo: the person's words quoted as
+written, the screenshot, a table of version, platform, page and device, what the app
+gathered, and the playback report folded away. It is labelled `bug-report`, `automated` and
+`platform:<platform>`, and the issue's number and address are written back into the report's
+file (`"issue"`). The account's email and the logs are not put in the issue: they stay in
+the report's file.
+
+- A report GitHub refuses is tried again every 10 minutes, 5 times. A refused token (401,
+  403, 404) costs no tries: everything waiting is filed once the token is put right.
+- One pass files at most 20, so a flood of reports is 20 issues and a log line, not hundreds.
+- Reports from before this was switched on (no `"issue"` entry in the file) are left alone.
+- The screenshot is shown in the issue by address, so it has to be reachable without signing
+  in to anything: anyone given its full address can open it. Nothing lists the addresses.
+
 ### App updates
 
 Public, read-only.
@@ -296,9 +324,11 @@ renamed into place so a half-uploaded file is never served.
 | `GOOGLE_DESKTOP_CLIENT_SECRET` | 🪟 | **Secret.** Desktop client secret from Google Cloud Console; `.env` on the server only. Without it `/api/auth/google-code` returns 503 |
 | `GOOGLE_TV_CLIENT_ID` / `GOOGLE_TV_CLIENT_SECRET` | 📺 | OAuth client of type "TVs and Limited Input devices", for TVs signing in through Google's device flow. Without them `/api/auth/tv/google` returns 404 and TVs pair through this server |
 | `PUBLIC_URL` | | Default `https://sync.thestoreisclosed.co.uk`. Cookies are `Secure` when it's https |
+| `GITHUB_REPO` | 🐞 | `owner/name`: where bug reports are filed as issues. Blank: reports are only kept |
+| `GITHUB_TOKEN` | 🐞 | **Secret.** A fine-grained personal access token for that one repository with *Issues: Read and write* and nothing else; `.env` on the server only |
 | `DATA_DIR` | | Default `/data`; the database is `$DATA_DIR/sync.db` (WAL mode) |
 
-<sub>✅ required · 🪟 needed for Windows sign-in · 📺 needed for TVs to sign in through Google</sub>
+<sub>✅ required · 🪟 needed for Windows sign-in · 📺 needed for TVs to sign in through Google · 🐞 needed to file bug reports as issues</sub>
 
 > [!WARNING]
 > The server refuses to start without `GOOGLE_CLIENT_ID` and a valid `SECRET_KEY`.

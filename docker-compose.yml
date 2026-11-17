@@ -17,6 +17,9 @@ services:
       GOOGLE_DESKTOP_CLIENT_SECRET: ${GOOGLE_DESKTOP_CLIENT_SECRET:-}
       GOOGLE_TV_CLIENT_ID: ${GOOGLE_TV_CLIENT_ID:-}
       GOOGLE_TV_CLIENT_SECRET: ${GOOGLE_TV_CLIENT_SECRET:-}
+      # Bug reports from the app are filed as issues on GITHUB_REPO. Unset: only kept.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_REPO: ${GITHUB_REPO:-}
       PUBLIC_URL: ${PUBLIC_URL:-https://sync.thestoreisclosed.co.uk}
       DATA_DIR: /data
       TZ: ${TZ:-Europe/London}

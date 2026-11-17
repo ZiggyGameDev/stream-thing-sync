@@ -1,4 +1,4 @@
-"""Watch together (/api/party) and problem reports (/api/report)."""
+"""Watch together (/api/party) and problem reports (/api/report; more in test_reports.py)."""
 
 import json
 

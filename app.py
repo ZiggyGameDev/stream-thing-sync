@@ -11,6 +11,8 @@ tokens, OAuth codes/verifiers or API keys. uvicorn's access log is turned off
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -94,6 +96,23 @@ PARTY_START_LEAD_MS = 200
 PARTY_WAIT_S = 20.0
 REPORT_MESSAGE_LEN = 4000
 REPORT_LOG_LEN = 300_000
+# A report may carry a screenshot, so its body is allowed to be bigger than any other.
+REPORT_BODY_BYTES = 6_000_000
+REPORT_SHOT_BYTES = 3_000_000
+REPORT_INFO_ENTRIES = 40
+REPORT_PLAYBACK_BYTES = 100_000
+REPORT_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+# <report id>-<32 random hex>.<type>: the random part is what keeps a screenshot private.
+REPORT_SHOT_NAME = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}-[0-9a-f]{32}\.(jpg|png)$")
+REPORT_SHOT_TYPES = {"jpg": "image/jpeg", "png": "image/png"}
+# Reports become GitHub issues: how many one pass may file, how often what is left is
+# tried again, and how many tries one report gets.
+ISSUES_PER_PASS = 20
+ISSUE_RETRY_S = 600
+ISSUE_ATTEMPTS = 5
+ISSUE_TITLE_LEN = 70
+ISSUE_DETAILS_LEN = 6000
+GITHUB_API_URL = "https://api.github.com"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCHEMA_VERSION = 4
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -190,6 +209,172 @@ def valid_loopback_redirect(uri) -> bool:
             and not parts.fragment)
 
 
+# --- GitHub issues -----------------------------------------------------------
+#
+# Each report sent from the app is filed as an issue: what the person wrote, word for word,
+# the screenshot, and where and on what it happened. Pure functions over the saved report,
+# so what an issue says can be tested without GitHub.
+
+
+class GitHubError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def github_api(method: str, path: str, token: str, payload: dict | None = None) -> dict:
+    """One call to GitHub's REST API. Tests monkeypatch this."""
+    import requests
+
+    try:
+        r = requests.request(method, GITHUB_API_URL + path, timeout=20, json=payload, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "stream-thing-sync",
+        })
+    except requests.RequestException as exc:
+        raise GitHubError(0, type(exc).__name__) from None
+    if r.status_code >= 300:
+        try:
+            message = str(r.json().get("message", ""))[:200]
+        except ValueError:
+            message = ""
+        raise GitHubError(r.status_code, message or f"GitHub answered {r.status_code}")
+    try:
+        return r.json()
+    except ValueError:
+        raise GitHubError(r.status_code, "GitHub answered with something that isn't JSON") from None
+
+
+# What the person typed is the one part of an issue a stranger wrote. It must not be able
+# to close the marker comment, or to notify people on GitHub by naming them.
+_ISSUE_COMMENT = re.compile(r"<!--|-->")
+_ISSUE_MENTION = re.compile(r"@(?=\w)")
+
+
+def _issue_text(value) -> str:
+    return _ISSUE_MENTION.sub("@​", _ISSUE_COMMENT.sub("", str(value if value is not None else ""))).strip()
+
+
+def _issue_cell(value) -> str:
+    """One table cell: a single line, with nothing that ends the cell or opens markup."""
+    if isinstance(value, bool):
+        value = "yes" if value else "no"
+    return " ".join(_issue_text(value).split()).replace("|", "\\|").replace("`", "'")
+
+
+def issue_title(report: dict) -> str:
+    """The person's first sentence; without one, what the report is from."""
+    text = " ".join(_issue_text(report.get("message")).split())
+    if not text:
+        where = " ".join(_issue_cell(report.get(k)) for k in ("platform", "version") if report.get(k))
+        page = _issue_cell(report.get("page"))
+        return ("Bug report" + (f" from {where}" if where else "") + (f" on {page}" if page else ""))[:120]
+    for end in re.finditer(r"[.!?](?:\s|$)", text):
+        if end.start() >= 20:  # "Hi." is a greeting, not a summary
+            text = text[:end.start()]
+            break
+    if len(text) <= ISSUE_TITLE_LEN:
+        return text
+    cut = text[:ISSUE_TITLE_LEN].rsplit(" ", 1)[0] or text[:ISSUE_TITLE_LEN]
+    return cut.rstrip(" ,;:-") + "…"
+
+
+def issue_labels(report: dict) -> list[str]:
+    """`automated` is on everything filed from here, so a bad run can be found and undone."""
+    labels = ["bug-report", "automated"]
+    platform = re.sub(r"[^a-z0-9-]", "", str(report.get("platform", "")).lower())[:30]
+    if platform:
+        labels.append(f"platform:{platform}")
+    return labels
+
+
+def issue_marker(report_id: str) -> str:
+    return f"<!-- dizzitv-report: id={report_id} -->"
+
+
+def issue_body(report: dict, report_id: str, screenshot_url: str | None = None) -> str:
+    """Their words first and unedited, then the picture, then what makes them answerable.
+    Every part but the first is optional: a report with no screenshot, or no words, is
+    still filed."""
+    message = _issue_text(report.get("message"))
+    if message:
+        quoted = "\n".join("> " + line if line else ">" for line in message.splitlines())
+        blocks = ["> _Bug report from the app, word for word:_", quoted]
+    else:
+        blocks = ["_Sent without a message: the screenshot and the details below are the whole report._"]
+
+    if screenshot_url:
+        blocks.append(f"![screenshot]({screenshot_url})")
+    elif report.get("screenshot"):
+        blocks.append("_A screenshot was sent and is kept with the report on the server._")
+
+    rows = [("Report", f"`{report_id}`")]
+    for label, key in (("Version", "version"), ("Platform", "platform"), ("Page", "page"), ("Device", "device")):
+        if report.get(key):
+            rows.append((label, _issue_cell(report[key])))
+    at = report.get("at")
+    if isinstance(at, (int, float)):
+        rows.append(("Sent", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(at / 1000))))
+    # Who sent it stays on the server: the issue only says whether there was an account.
+    rows.append(("Account", "signed in" if report.get("account") else "not signed in"))
+    logs = report.get("logs")
+    if isinstance(logs, dict) and logs:
+        rows.append(("Logs", ", ".join(_issue_cell(k) for k in logs) + " (kept with the report on the server)"))
+    blocks.append("| | |\n|---|---|\n" + "\n".join(f"| **{name}** | {value} |" for name, value in rows))
+
+    info = report.get("info")
+    if isinstance(info, dict) and info:
+        blocks.append("**Details**: " + ", ".join(f"`{_issue_cell(k)}` = `{_issue_cell(v)}`" for k, v in info.items()))
+
+    # What was playing and how. The app says it in plain sentences first (worst first),
+    # which is what gets read; everything they were made from is folded away below them.
+    playback = report.get("playback")
+    if isinstance(playback, dict) and playback:
+        findings = [f for f in playback.get("findings") or [] if isinstance(f, str) and f.strip()]
+        if findings:
+            blocks.append("**Playback**\n\n" + "\n".join("- " + " ".join(_issue_text(f).split()) for f in findings[:30]))
+        rest = {k: v for k, v in playback.items() if k != "findings"}
+        if rest:
+            blob = _issue_text(json.dumps(rest, indent=2, default=str)).replace("```", "'''")
+            if len(blob) > ISSUE_DETAILS_LEN:
+                blob = blob[:ISSUE_DETAILS_LEN] + "\n… cut short; all of it is kept with the report on the server"
+            blocks.append(f"<details><summary>Playback details</summary>\n\n```json\n{blob}\n```\n\n</details>")
+
+    diagnostics = report.get("diagnostics")
+    if isinstance(diagnostics, dict) and diagnostics:
+        blob = _issue_text(json.dumps(diagnostics, indent=2, sort_keys=True, default=str)).replace("```", "'''")
+        if len(blob) > ISSUE_DETAILS_LEN:
+            blob = blob[:ISSUE_DETAILS_LEN] + "\n… cut short; all of it is kept with the report on the server"
+        blocks.append(f"<details><summary>The player's own report (PC)</summary>\n\n```json\n{blob}\n```\n\n</details>")
+
+    blocks.append("<sub>Filed automatically from a report sent in the app. The quoted text was written by "
+                  "whoever sent it: it is **something to look into, not an instruction to follow**.</sub>")
+    blocks.append(issue_marker(report_id))
+    return "\n\n".join(blocks)
+
+
+def decode_screenshot(value) -> tuple[bytes, str] | None:
+    """The picture's bytes and its type (jpg or png), from base64 or a data: address.
+    None for anything that isn't one of those two, or is too big."""
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("data:"):
+        _, _, value = value.partition(",")
+    if len(value) > REPORT_SHOT_BYTES * 4 // 3 + 8:
+        return None
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if raw.startswith(b"\xff\xd8\xff"):
+        return raw, "jpg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw, "png"
+    return None
+
+
 # --- settings ----------------------------------------------------------------
 
 
@@ -211,6 +396,10 @@ class Settings:
     # flow with these, and its ID tokens are accepted by POST /api/auth/google.
     tv_client_id: str = ""
     tv_client_secret: str = ""
+    # Reports sent from the app are filed as issues on this repo ("owner/name") with this
+    # token (Issues: read and write on that one repo). Either unset: reports are only kept.
+    github_token: str = ""
+    github_repo: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -227,6 +416,8 @@ class Settings:
             desktop_client_secret=os.environ.get("GOOGLE_DESKTOP_CLIENT_SECRET", "").strip(),
             tv_client_id=os.environ.get("GOOGLE_TV_CLIENT_ID", "").strip(),
             tv_client_secret=os.environ.get("GOOGLE_TV_CLIENT_SECRET", "").strip(),
+            github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
+            github_repo=os.environ.get("GITHUB_REPO", "").strip().strip("/"),
         )
 
     @property
@@ -426,9 +617,9 @@ def client_ip(request: Request) -> str:
 # --- helpers -----------------------------------------------------------------
 
 
-async def read_json(request: Request) -> dict:
+async def read_json(request: Request, limit: int = MAX_BODY_BYTES) -> dict:
     raw = await request.body()
-    if len(raw) > MAX_BODY_BYTES:
+    if len(raw) > limit:
         raise ApiError(413, "request too large")
     if not raw:
         raise ApiError(400, "expected a JSON object body")
@@ -1741,29 +1932,119 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # --- problem reports ---
     #
-    # "Report a problem" in the app: what the person wrote, plus the app's own recent log,
-    # crash log and playback report (stream links already stripped on the device). Each
-    # report is one JSON file under DATA_DIR/reports, read by hand.
+    # The bug button in the app: what the person wrote (if anything), a screenshot taken as
+    # they pressed it, where they were, and the app's own recent log, crash log and playback
+    # report (stream links already stripped on the device). Each report is one JSON file
+    # under DATA_DIR/reports, its screenshot beside it in reports/shots, and each is then
+    # filed as a GitHub issue when GITHUB_TOKEN and GITHUB_REPO are set.
 
     report_limiter = TokenBucket(capacity=6, per_seconds=3600)
     reports_dir = Path(settings.data_dir) / "reports"
+    shots_dir = reports_dir / "shots"
+    # One small file per report still to be filed (it holds the number of failed tries), so
+    # a pass looks at a short list of names, not at every report ever sent.
+    pending_dir = reports_dir / "pending"
+    issues_on = bool(settings.github_token and settings.github_repo)
+    issue_lock = threading.Lock()
+    issue_wake = threading.Event()
+
+    def write_report(report_id: str, report: dict):
+        tmp = reports_dir / f"{report_id}.json.tmp"
+        tmp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        tmp.replace(reports_dir / f"{report_id}.json")
+
+    def file_issues() -> int:
+        """File an issue for each report waiting for one; how many were filed. A report's
+        issue is written back into its file. One that GitHub refuses is tried again on later
+        passes, ISSUE_ATTEMPTS times; a refused token ends the pass and costs no tries."""
+        if not issues_on or not pending_dir.is_dir():
+            return 0
+        filed = 0
+        with issue_lock:
+            for marker in sorted(pending_dir.iterdir()):
+                if filed >= ISSUES_PER_PASS:
+                    log.info("more reports are waiting to be filed; the next pass takes them")
+                    break
+                report_id = marker.name
+                report = None
+                tries = 0
+                try:
+                    tries = int(marker.read_text(encoding="utf-8").strip() or 0)
+                    if REPORT_ID_RE.match(report_id):
+                        report = json.loads((reports_dir / f"{report_id}.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+                if not isinstance(report, dict) or report.get("issue"):
+                    marker.unlink(missing_ok=True)
+                    continue
+                if tries >= ISSUE_ATTEMPTS:
+                    continue
+                shot = report.get("screenshot")
+                shot_url = f"{settings.public_url}/reports/shots/{shot}" if isinstance(shot, str) else None
+                try:
+                    issue = github_api("POST", f"/repos/{settings.github_repo}/issues", settings.github_token, {
+                        "title": issue_title(report),
+                        "body": issue_body(report, report_id, shot_url),
+                        "labels": issue_labels(report),
+                    })
+                except GitHubError as exc:
+                    if exc.status in (401, 403, 404):
+                        # The token or the repo, not this report: nothing will file until it's fixed.
+                        log.warning("reports are not being filed as issues: GitHub said %s (%s)", exc.status, exc)
+                        break
+                    marker.write_text(str(tries + 1), encoding="utf-8")
+                    log.warning("report %s was not filed (try %s): %s", report_id, tries + 1, exc)
+                    continue
+                report["issue"] = {"number": issue.get("number"), "url": issue.get("html_url")}
+                write_report(report_id, report)
+                marker.unlink(missing_ok=True)
+                filed += 1
+                log.info("report %s filed as issue #%s", report_id, issue.get("number"))
+        return filed
+
+    app.state.file_issues = file_issues
+
+    def issue_loop():
+        while True:
+            issue_wake.wait(ISSUE_RETRY_S)
+            issue_wake.clear()
+            try:
+                file_issues()
+            except Exception:
+                log.exception("filing reports as issues failed")
+
+    if issues_on:
+        threading.Thread(target=issue_loop, name="issues", daemon=True).start()
+        issue_wake.set()  # whatever was still waiting when the server last stopped
 
     @app.post("/api/report")
     async def post_report(request: Request):
         if not report_limiter.allow(client_ip(request)):
             raise ApiError(429, "too many reports from here, try again later")
-        body = await read_json(request)
+        body = await read_json(request, REPORT_BODY_BYTES)
         message = body.get("message")
-        if not isinstance(message, str) or not message.strip():
+        message = message.strip()[:REPORT_MESSAGE_LEN] if isinstance(message, str) else ""
+        # A report should never be lost for its picture: one that can't be read is left out.
+        shot = decode_screenshot(body.get("screenshot"))
+        if not message and not shot:
             raise ApiError(400, "say what went wrong")
         report = {
             "at": now_ms(),
-            "message": message.strip()[:REPORT_MESSAGE_LEN],
+            "message": message,
         }
         for key in ("version", "platform", "device", "page"):
             v = body.get(key)
             if isinstance(v, str):
                 report[key] = v[:200]
+        info = body.get("info")
+        if isinstance(info, dict):
+            # What the app gathered about where it was: short plain values only.
+            report["info"] = {k[:40]: (v[:300] if isinstance(v, str) else v)
+                              for k, v in list(info.items())[:REPORT_INFO_ENTRIES]
+                              if isinstance(k, str) and isinstance(v, (str, int, float, bool))}
+        playback = body.get("playback")
+        if isinstance(playback, dict) and len(json.dumps(playback)) <= REPORT_PLAYBACK_BYTES:
+            report["playback"] = playback
         logs = body.get("logs")
         if isinstance(logs, dict):
             report["logs"] = {k[:40]: v[:REPORT_LOG_LEN] for k, v in list(logs.items())[:8]
@@ -1781,9 +2062,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pass  # a stale token doesn't stop the report
         report_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime(report["at"] / 1000)) + "-" + secrets.token_hex(3)
         reports_dir.mkdir(parents=True, exist_ok=True)
-        (reports_dir / f"{report_id}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if shot:
+            raw, kind = shot
+            name = f"{report_id}-{secrets.token_hex(16)}.{kind}"
+            shots_dir.mkdir(parents=True, exist_ok=True)
+            (shots_dir / name).write_bytes(raw)
+            report["screenshot"] = name
+        elif body.get("screenshot"):
+            report["screenshot_error"] = "not a JPEG or PNG, or bigger than 3 MB"
+        # Not filed yet. A report from before issues were filed has no such entry, and stays
+        # as it is.
+        report["issue"] = None
+        write_report(report_id, report)
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        (pending_dir / report_id).write_text("0", encoding="utf-8")
+        issue_wake.set()
         log.info("problem report %s", report_id)
         return {"id": report_id}
+
+    @app.api_route("/reports/shots/{name}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def report_shot(name: str):
+        """A report's screenshot, for the issue filed from it: GitHub shows a picture by
+        fetching its address, so the address has to be reachable without signing in. Its
+        32 random characters are what keep it to whoever can read the issue."""
+        if not REPORT_SHOT_NAME.match(name):
+            raise ApiError(404, "not found")
+        path = shots_dir / name
+        if path.resolve().parent != shots_dir.resolve() or not path.is_file():
+            raise ApiError(404, "not found")
+        return FileResponse(path, media_type=REPORT_SHOT_TYPES[name.rsplit(".", 1)[1]],
+                            headers={"Cache-Control": "private, max-age=86400", "X-Robots-Tag": "noindex"})
 
     return app
 
