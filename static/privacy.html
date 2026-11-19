@@ -1,26 +1,43 @@
     <h2>Privacy</h2>
-    <p class="muted">Last updated 29 October 2026</p>
-    <p>stream-thing sync keeps your stream-thing app in step across your own phones, TVs and PCs. This page says, in plain words, what it keeps and why.</p>
+    <p class="muted">Last updated 19 November 2026</p>
+    <p>stream-thing sync keeps the DizziTV app (stream-thing) in step across your own phones, TVs and PCs. This page says, in plain words, what it keeps and why.</p>
 
-    <h3>What is stored</h3>
+    <h3>What is stored with your account</h3>
     <ul>
-      <li>From “Sign in with Google” (in the stream-thing app or on this website): your Google account ID, email address, name and profile picture link. Nothing else from your Google account is requested.</li>
+      <li>From “Sign in with Google” (in the app or on this website): your Google account ID, email address, name and profile picture link. Nothing else from your Google account is requested.</li>
       <li>The API keys you choose to save (TorBox, Real-Debrid, MDBList, aioratings poster key) and which debrid service you use. Keys are encrypted before they are written to disk.</li>
-      <li>Your watch progress: which videos you've watched, how far through you are, and when.</li>
+      <li>Your watch progress, My list, profiles, settings and installed addons.</li>
       <li>The names of the devices you sign in to the app on, and when each was signed in and last used.</li>
     </ul>
+    <p>Only so you can sign in on another of your devices and pick up where you were. Nothing else.</p>
 
-    <h3>Why</h3>
-    <p>Only so you can sign in on another of your devices and pick up your keys and progress there. Nothing else.</p>
+    <h3>Anonymous usage counts</h3>
+    <p>Separately from any account, the app sends anonymous counts about once a day, so we can see what it is used for:</p>
+    <ul>
+      <li>which sections were opened, and how many times;</li>
+      <li>how many things were played, how many failed to play, and for how many minutes, by kind (film, episode, live channel, sport, esports);</li>
+      <li>which features were used (watch party, downloads, reminders, the bug button);</li>
+      <li>the kind of device (for example “Android TV”), the app's version, and roughly how it is set up: signed in or not, which debrid service, about how many addons, and roughly how long the app has been installed.</li>
+    </ul>
+    <p>The report carries no account, no device ID and nothing that links one report to the next. It never includes titles, searches, addon addresses, or anything about channels you made yourself. It is sent without your sign-in. The server adds the numbers to daily totals; it keeps no record of single reports and does not store the IP address they came from (the address is used, in memory, only to stop one sender flooding the counts).</p>
+
+    <h3>Live channel viewers</h3>
+    <p>While you watch one of the app's own live channels, the app tells the server which channel once a minute, with a random pass it makes up when you tune in and throws away when you leave. The server holds these in memory for a couple of minutes to count how many are watching, and writes down only each channel's daily totals. Channels you made yourself are never named.</p>
+
+    <h3>Turning it off</h3>
+    <p>In the app: Settings → About → “Share anonymous usage counts”. With it off, the app sends no counts and is not counted as watching a channel.</p>
+
+    <h3>Bug reports</h3>
+    <p>Only when you press the bug button and send one: your message, a screenshot of the app, and the app's recent logs. If you are signed in, your email is attached so the report can be followed up.</p>
 
     <h3>Sharing</h3>
     <p>Your data is not shared with anyone and is never sold.</p>
 
     <h3>Cookies and tracking</h3>
-    <p>There are no ads, no tracking and no analytics. The website sets one cookie: a session cookie that keeps you signed in. Google's sign-in button is loaded from Google, which handles the sign-in itself under Google's own privacy policy.</p>
+    <p>There are no ads, and nothing follows you as a person: the only analytics are the anonymous counts above. The website sets one cookie: a session cookie that keeps you signed in. Google's sign-in button is loaded from Google, which handles the sign-in itself under Google's own privacy policy.</p>
 
     <h3>Deleting your data</h3>
-    <p>Sign in on this site and choose “Delete account”. Your account, saved keys, watch progress, devices and sessions are deleted immediately. You can also sign out individual devices at any time.</p>
+    <p>Sign in on this site and choose “Delete account”. Your account, saved keys, watch progress, devices and sessions are deleted immediately. You can also sign out individual devices at any time. The anonymous counts are totals with nothing of yours in them, so there is nothing of yours to delete there.</p>
 
     <h3>Contact</h3>
     <p>Questions or requests: open an issue at <a href="https://github.com/ZiggyGameDev/stream-thing-sync/issues">github.com/ZiggyGameDev/stream-thing-sync</a>.</p>

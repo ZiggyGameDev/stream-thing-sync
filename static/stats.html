@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex">
+<title>Usage · stream-thing sync</title>
+<style>
+  :root { --bg: #0e0f13; --panel: #171920; --line: #2a2e3a; --text: #e8e9ee; --muted: #9096a6; --accent: #7c8cff; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 24px 16px 48px; }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h1 span { color: var(--accent); }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 16px 0; }
+  input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  input { flex: 1; min-width: 180px; }
+  button { cursor: pointer; background: var(--accent); border-color: var(--accent); color: #0e0f13; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; overflow-x: auto; }
+  .card.wide { grid-column: 1 / -1; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 14px; }
+  .tile b { display: block; font-size: 26px; line-height: 1.2; font-variant-numeric: tabular-nums; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
+  tr:last-child td { border-bottom: 0; }
+  #error { color: #ff8f8f; }
+</style>
+</head>
+<body>
+<main>
+  <h1>stream-thing <span>usage</span></h1>
+  <p class="muted">Anonymous counts, added up per day (UTC). A device reports once a day, so what it did shows up on the day it next opens the app.</p>
+  <form class="bar" id="form">
+    <input id="token" type="password" placeholder="Stats password" autocomplete="off" aria-label="Stats password">
+    <select id="days" aria-label="Period">
+      <option value="7">Last 7 days</option>
+      <option value="30" selected>Last 30 days</option>
+      <option value="90">Last 90 days</option>
+      <option value="365">Last year</option>
+    </select>
+    <button type="submit">Show</button>
+  </form>
+  <p id="error"></p>
+  <div id="out"></div>
+</main>
+<script>
+(function () {
+  var form = document.getElementById('form');
+  var tokenBox = document.getElementById('token');
+  var out = document.getElementById('out');
+  var error = document.getElementById('error');
+  try { tokenBox.value = sessionStorage.getItem('stats-token') || ''; } catch (e) {}
+
+  function el(tag, text, cls) {
+    var n = document.createElement(tag);
+    if (text !== undefined) n.textContent = String(text);
+    if (cls) n.className = cls;
+    return n;
+  }
+  var num = function (n) { return Math.round(n).toLocaleString('en-GB'); };
+  var hours = function (mins) { return (mins / 60).toLocaleString('en-GB', { maximumFractionDigits: 1 }); };
+  var share = function (n, of) { return of ? Math.round((n / of) * 100) + '%' : ''; };
+
+  function table(head, rows) {
+    var t = el('table');
+    var hr = el('tr');
+    head.forEach(function (h) { hr.appendChild(el('th', h)); });
+    t.appendChild(hr);
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      r.forEach(function (c) { tr.appendChild(el('td', c)); });
+      t.appendChild(tr);
+    });
+    if (!rows.length) {
+      var tr = el('tr');
+      var td = el('td', 'Nothing yet', 'muted');
+      td.colSpan = head.length;
+      tr.appendChild(td);
+      t.appendChild(tr);
+    }
+    return t;
+  }
+  function card(title, body, wide) {
+    var c = el('section', undefined, 'card' + (wide ? ' wide' : ''));
+    c.appendChild(el('h2', title));
+    c.appendChild(body);
+    return c;
+  }
+  function tile(label, value) {
+    var c = el('div', undefined, 'card tile');
+    c.appendChild(el('b', value));
+    c.appendChild(el('span', label, 'muted'));
+    return c;
+  }
+
+  function draw(data) {
+    var total = {};          // key -> n over the period
+    var byDay = {};          // day -> key -> n
+    var dayPlatform = {};    // day -> platform -> devices
+    var byVersion = {};      // version -> devices (device-days)
+    var peak = {};           // channel -> most at once
+    var platforms = {};
+    data.rows.forEach(function (r) {
+      var day = r[0], platform = r[1], version = r[2], key = r[3], n = r[4];
+      if (key.indexOf('live.peak.') === 0) {
+        var ch = key.slice(10);
+        peak[ch] = Math.max(peak[ch] || 0, n);
+        return;
+      }
+      total[key] = (total[key] || 0) + n;
+      (byDay[day] = byDay[day] || {})[key] = ((byDay[day] || {})[key] || 0) + n;
+      if (key === 'active.day') {
+        platforms[platform] = true;
+        (dayPlatform[day] = dayPlatform[day] || {})[platform] = ((dayPlatform[day] || {})[platform] || 0) + n;
+        byVersion[version] = (byVersion[version] || 0) + n;
+      }
+    });
+    var get = function (k) { return total[k] || 0; };
+    var days = Object.keys(byDay).sort().reverse();
+    var today = byDay[data.today] || {};
+    // The first report of a week or month is flagged, so the flags since it began add up to its devices.
+    var monday = new Date(data.today + 'T00:00:00Z');
+    monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7));
+    var weekFrom = monday.toISOString().slice(0, 10);
+    var monthFrom = data.today.slice(0, 8) + '01';
+    var week = 0, month = 0;
+    days.forEach(function (d) {
+      if (d >= weekFrom) week += byDay[d]['active.week'] || 0;
+      if (d >= monthFrom) month += byDay[d]['active.month'] || 0;
+    });
+    var watchingNow = Object.keys(data.watching).reduce(function (a, k) { return a + data.watching[k]; }, 0);
+
+    out.textContent = '';
+    var tiles = el('div', undefined, 'tiles');
+    tiles.appendChild(tile('devices today', num(today['active.day'] || 0)));
+    tiles.appendChild(tile('devices this week', num(week)));
+    tiles.appendChild(tile('devices this month', num(month)));
+    tiles.appendChild(tile('watching live now', num(watchingNow)));
+    out.appendChild(tiles);
+
+    var grid = el('div', undefined, 'grid');
+    var plats = Object.keys(platforms).sort();
+    grid.appendChild(card('Devices per day', table(
+      ['Day', 'Devices', 'New'].concat(plats),
+      days.map(function (d) {
+        return [d, num(byDay[d]['active.day'] || 0), num(byDay[d]['age.new'] || 0)].concat(
+          plats.map(function (p) { return num((dayPlatform[d] || {})[p] || 0); }));
+      })), true));
+
+    var prefix = function (p) {
+      return Object.keys(total).filter(function (k) { return k.indexOf(p) === 0; })
+        .map(function (k) { return [k.slice(p.length), total[k]]; })
+        .sort(function (a, b) { return b[1] - a[1]; });
+    };
+    var sum = function (list) { return list.reduce(function (a, r) { return a + r[1]; }, 0); };
+
+    var opens = prefix('open.');
+    grid.appendChild(card('Sections opened', table(['Section', 'Times', 'Share'],
+      opens.map(function (r) { return [r[0], num(r[1]), share(r[1], sum(opens))]; }))));
+
+    var kinds = {};
+    ['play.', 'fail.', 'mins.'].forEach(function (p) { prefix(p).forEach(function (r) { kinds[r[0]] = true; }); });
+    var allMins = sum(prefix('mins.'));
+    grid.appendChild(card('What is watched', table(['Kind', 'Plays', 'Failed', 'Hours', 'Share of hours'],
+      Object.keys(kinds).sort(function (a, b) { return get('mins.' + b) - get('mins.' + a); }).map(function (k) {
+        return [k, num(get('play.' + k)), num(get('fail.' + k)), hours(get('mins.' + k)), share(get('mins.' + k), allMins)];
+      }))));
+
+    grid.appendChild(card('Features used', table(['Feature', 'Times'],
+      prefix('use.').map(function (r) { return [r[0], num(r[1])]; }))));
+
+    var devices = get('active.day');
+    grid.appendChild(card('How devices are set up', table(['', 'Device-days', 'Share'],
+      prefix('is.').map(function (r) { return [r[0], num(r[1]), share(r[1], devices)]; }))));
+
+    grid.appendChild(card('How long the app has been installed', table(['Age', 'Device-days', 'Share'],
+      ['new', 'week', 'month', 'quarter', 'older'].map(function (a) {
+        var label = { new: 'first day', week: 'under a week', month: 'under a month', quarter: 'under three months', older: 'three months or more' }[a];
+        return [label, num(get('age.' + a)), share(get('age.' + a), devices)];
+      }))));
+
+    grid.appendChild(card('App versions', table(['Version', 'Device-days', 'Share'],
+      Object.keys(byVersion).sort(function (a, b) { return byVersion[b] - byVersion[a]; }).map(function (v) {
+        return [v || '-', num(byVersion[v]), share(byVersion[v], devices)];
+      }))));
+
+    var chans = {};
+    prefix('live.mins.').forEach(function (r) { chans[r[0]] = true; });
+    Object.keys(peak).concat(Object.keys(data.watching)).forEach(function (c) { chans[c] = true; });
+    grid.appendChild(card('Live channels', table(['Channel', 'Watching now', 'Most at once', 'Viewer-hours'],
+      Object.keys(chans).filter(function (c) { return c !== 'other' || get('live.mins.other') || data.watching.other; })
+        .sort(function (a, b) { return get('live.mins.' + b) - get('live.mins.' + a); }).map(function (c) {
+          return [c, num(data.watching[c] || 0), num(peak[c] || 0), hours(get('live.mins.' + c))];
+        })), true));
+    out.appendChild(grid);
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    error.textContent = '';
+    var token = tokenBox.value.trim();
+    if (!token) return;
+    fetch('/api/stats?days=' + encodeURIComponent(document.getElementById('days').value), {
+      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+    }).then(function (r) {
+      return r.json().then(function (body) {
+        if (!r.ok) throw new Error(body.error || String(r.status));
+        try { sessionStorage.setItem('stats-token', token); } catch (e) {}
+        draw(body);
+      });
+    }).catch(function (e) {
+      out.textContent = '';
+      error.textContent = 'Could not load: ' + e.message;
+    });
+  });
+  if (tokenBox.value) form.requestSubmit();
+})();
+</script>
+</body>
+</html>

@@ -231,7 +231,7 @@ managing the account; devices sign in from inside the app.
 | `DELETE` | `/api/web/devices/{id}` | Signs that device out |
 | `DELETE` | `/api/web/account` | Deletes the user and everything belonging to them |
 
-Pages: `/` (account: keys, devices, sign out, delete), `/privacy`, `/terms`.
+Pages: `/` (account: keys, devices, sign out, delete), `/privacy`, `/terms`, `/stats`.
 `GET /healthz` → `{"ok": true}`.
 
 ### Bug reports (public)
@@ -261,6 +261,33 @@ the report's file.
 - Reports from before this was switched on (no `"issue"` entry in the file) are left alone.
 - The screenshot is shown in the issue by address, so it has to be reachable without signing
   in to anything: anyone given its full address can open it. Nothing lists the addresses.
+
+### Anonymous usage counts (public)
+
+What the app is used for, as totals per day. A report carries counts, the kind of device
+and the app's version: no account, no device id, nothing about what was watched. It is sent
+without a token (one sent with a token has it ignored), and the address it came from is
+used for the rate limit only, in memory.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/api/usage` | `{"platform", "version", "counts": {"<key>": n}}` | → `{"ok": true}`. About once a day per device. Only the keys in `USAGE_KEYS` (`app.py`) are kept, each up to its limit; anything else is dropped without failing the report. `platform` and `version` outside what's known are filed as `other`. Body ≤8 KB. 120 per IP per day |
+| POST | `/api/live/watching` | `{"channel", "token"}`, or with `"leave": true` | → `{"watching", "every"}`. Sent every `every` seconds while one of the app's live channels is on. `token` is 16 to 40 random characters made up on tuning in. `watching` is 0 below 2. `every` 0: stop sending. Held in memory only. 30 per IP per minute |
+| GET | `/api/live/viewers` | | → `{"viewers": {"<channel>": n}, "every"}`: channels with 2 or more watching. `Cache-Control: public, max-age=30` |
+| GET | `/api/stats?days=30` | | `Authorization: Bearer <STATS_TOKEN>`. → `{"today", "since", "rows": [[day, platform, version, key, n]], "watching"}`. 404 without `STATS_TOKEN` |
+
+Counts are held in memory and written once a minute to one table, `usage`, a row per day,
+platform, version and key. Devices in use are counted without telling them apart: a
+device's first report of a day, week and month carries `active.day`, `active.week` and
+`active.month`, and those add up. Each beat on a live channel adds to that channel's
+`live.mins.<channel>` for the day, and the most watching at once is kept as
+`live.peak.<channel>`.
+
+`/stats` is the page that shows it all, behind `STATS_TOKEN`.
+
+To let Cloudflare answer the guide's requests, add a Cache Rule for
+`/api/live/viewers` (eligible for cache, respect origin TTL). Without it they reach this
+server, where each is a read from memory.
 
 ### App updates
 
@@ -326,6 +353,8 @@ renamed into place so a half-uploaded file is never served.
 | `PUBLIC_URL` | | Default `https://sync.thestoreisclosed.co.uk`. Cookies are `Secure` when it's https |
 | `GITHUB_REPO` | 🐞 | `owner/name`: where bug reports are filed as issues. Blank: reports are only kept |
 | `GITHUB_TOKEN` | 🐞 | **Secret.** A fine-grained personal access token for that one repository with *Issues: Read and write* and nothing else; `.env` on the server only |
+| `STATS_TOKEN` | | **Secret.** The password for `/stats`, at least 24 characters. Blank: no stats page |
+| `LIVE_EVERY_S` | | Default `60`: how often a device watching a live channel says so, seconds (30 to 900). `0` turns live viewer counts off |
 | `DATA_DIR` | | Default `/data`; the database is `$DATA_DIR/sync.db` (WAL mode) |
 
 <sub>✅ required · 🪟 needed for Windows sign-in · 📺 needed for TVs to sign in through Google · 🐞 needed to file bug reports as issues</sub>

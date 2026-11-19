@@ -125,6 +125,44 @@ UPDATE_FILE_TYPES = {
 }
 UPDATE_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+# Anonymous usage counts: what the app is used for, added up per day. A device sends one
+# small report a day carrying counts and nothing that says who or what it is. Only the names
+# below are kept (anything else in a report is dropped, so an app newer or older than this
+# server loses a count and not the whole report), each up to its limit per report.
+USAGE_BODY_BYTES = 8_000
+USAGE_PLATFORMS = ("windows", "mac", "linux", "android", "android-tv", "samsung-tv", "lg-tv")
+USAGE_VERSION_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,4}$")
+USAGE_SECTIONS = ("home", "films", "shows", "sport", "live", "esports", "discover", "search",
+                  "mylist", "downloads", "addons", "settings", "title")
+USAGE_KINDS = ("film", "episode", "live", "sport", "esports", "other")
+USAGE_FEATURES = ("party", "download", "report", "reminder")
+USAGE_KEYS: dict[str, int] = {
+    **{f"open.{s}": 200 for s in USAGE_SECTIONS},
+    **{f"play.{k}": 100 for k in USAGE_KINDS},
+    **{f"fail.{k}": 100 for k in USAGE_KINDS},
+    **{f"mins.{k}": 1440 for k in USAGE_KINDS},
+    **{f"use.{f}": 50 for f in USAGE_FEATURES},
+    # The first report of a day, a week and a month: adding them up counts the devices in
+    # use over each, with nothing to tell one device from another.
+    **{f"active.{p}": 1 for p in ("day", "week", "month")},
+    # How long the app has been on the device, roughly.
+    **{f"age.{a}": 1 for a in ("new", "week", "month", "quarter", "older")},
+    # How it is set up.
+    **{f"is.{s}": 1 for s in ("signed-in", "signed-out", "debrid.torbox", "debrid.realdebrid", "debrid.none",
+                              "addons.0", "addons.1-3", "addons.4-9", "addons.10+")},
+}
+USAGE_FLUSH_S = 60
+USAGE_STATS_DAYS = 400
+
+# Live channels: how many are watching each. Only the app's own channels are told apart; a
+# key this server doesn't know (a channel newer than it) is counted under "other".
+LIVE_CHANNELS = ("sitcoms", "cartoons", "british", "scifi", "crime", "marvel", "nature", "history")
+LIVE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,40}$")
+LIVE_PER_IP = 6            # one address counts for this many viewers of a channel at most
+LIVE_SHOW_FROM = 2         # fewer than this watching is not said: one viewer is just you
+LIVE_COUNT_S = 5.0         # a channel's viewers are counted again this often at most
+LIVE_MAX_TOKENS = 50_000   # per channel
+
 
 def now_ms() -> int:
     """Wall clock in ms. Module-level so tests can monkeypatch it."""
@@ -382,6 +420,15 @@ def _split_ids(value: str) -> tuple[str, ...]:
     return tuple(x.strip() for x in value.split(",") if x.strip())
 
 
+def _live_every(value: str) -> int:
+    """LIVE_EVERY_S: 0 turns live viewer counts off, otherwise 30 seconds to 15 minutes."""
+    try:
+        seconds = int(value.strip() or 60)
+    except ValueError:
+        return 60
+    return 0 if seconds <= 0 else max(30, min(900, seconds))
+
+
 @dataclass
 class Settings:
     google_client_id: str  # the web client: website sign-in, and always an accepted app audience
@@ -400,6 +447,10 @@ class Settings:
     # token (Issues: read and write on that one repo). Either unset: reports are only kept.
     github_token: str = ""
     github_repo: str = ""
+    # The password for /stats (the usage counts). Unset: there is no stats page.
+    stats_token: str = ""
+    # How often a device watching a live channel says so, seconds. 0: live viewer counts off.
+    live_every_s: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -418,6 +469,8 @@ class Settings:
             tv_client_secret=os.environ.get("GOOGLE_TV_CLIENT_SECRET", "").strip(),
             github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
             github_repo=os.environ.get("GITHUB_REPO", "").strip().strip("/"),
+            stats_token=os.environ.get("STATS_TOKEN", "").strip(),
+            live_every_s=_live_every(os.environ.get("LIVE_EVERY_S", "")),
         )
 
     @property
@@ -524,6 +577,14 @@ CREATE TABLE IF NOT EXISTS addons (
     blob       BLOB NOT NULL,
     updated_at INTEGER NOT NULL   -- the device's clock: decides which write wins
 );
+CREATE TABLE IF NOT EXISTS usage (
+    day      TEXT NOT NULL,       -- UTC, YYYY-MM-DD: when the report arrived
+    platform TEXT NOT NULL,
+    version  TEXT NOT NULL,
+    key      TEXT NOT NULL,       -- what was counted (USAGE_KEYS, live.mins.*, live.peak.*)
+    n        INTEGER NOT NULL,
+    PRIMARY KEY (day, platform, version, key)
+) WITHOUT ROWID;
 """
 
 
@@ -713,7 +774,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         if request.url.path.startswith("/api/"):
             response.headers.setdefault("Cache-Control", "no-store")
-        if request.url.path != "/healthz":
+        # Not /api/live/: a line a minute for every device watching a channel is all noise.
+        if request.url.path != "/healthz" and not request.url.path.startswith("/api/live/"):
             # Path only, never query strings.
             log.info("%s %s %s %.0fms", request.method, request.url.path, response.status_code,
                      (time.perf_counter() - start) * 1000)
@@ -2092,6 +2154,216 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ApiError(404, "not found")
         return FileResponse(path, media_type=REPORT_SHOT_TYPES[name.rsplit(".", 1)[1]],
                             headers={"Cache-Control": "private, max-age=86400", "X-Robots-Tag": "noindex"})
+
+    # --- anonymous usage counts ---
+    #
+    # What the app is used for, as totals per day. A report carries counts, the kind of
+    # device and the app's version: no account, no device id, nothing about what was watched
+    # (the app sends it without its sign-in token, and one sent with a token has it ignored).
+    # The address it came from is used for the rate limit, in memory, and never stored.
+    # Counts wait in memory and are written once a minute in one go, so a report costs no
+    # disk write of its own. A restart loses at most that minute.
+
+    usage_limiter = TokenBucket(capacity=120, per_seconds=86400)  # reports, per IP
+    usage_adds: dict[tuple[str, str, str, str], int] = {}
+    usage_peaks: dict[tuple[str, str, str, str], int] = {}
+    usage_lock = threading.Lock()
+
+    def usage_day() -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(now_ms() / 1000))
+
+    def usage_add(day: str, platform: str, version: str, key: str, n: int) -> None:
+        with usage_lock:
+            k = (day, platform, version, key)
+            usage_adds[k] = usage_adds.get(k, 0) + n
+
+    def flush_usage() -> int:
+        """Write what has been counted since the last time; how many rows that touched."""
+        with usage_lock:
+            adds, peaks = dict(usage_adds), dict(usage_peaks)
+            usage_adds.clear()
+            usage_peaks.clear()
+        if not adds and not peaks:
+            return 0
+        upsert = ("INSERT INTO usage (day, platform, version, key, n) VALUES (?,?,?,?,?) "
+                  "ON CONFLICT(day, platform, version, key) DO UPDATE SET n = ")
+        try:
+            with db.connect() as conn:
+                conn.executemany(upsert + "n + excluded.n", [(*k, n) for k, n in adds.items()])
+                conn.executemany(upsert + "MAX(n, excluded.n)", [(*k, n) for k, n in peaks.items()])
+        except Exception:
+            # Kept for the next pass, with whatever has been counted meanwhile.
+            with usage_lock:
+                for k, n in adds.items():
+                    usage_adds[k] = usage_adds.get(k, 0) + n
+                for k, n in peaks.items():
+                    usage_peaks[k] = max(usage_peaks.get(k, 0), n)
+            raise
+        return len(adds) + len(peaks)
+
+    app.state.flush_usage = flush_usage
+
+    def usage_loop():
+        while True:
+            time.sleep(USAGE_FLUSH_S)
+            try:
+                flush_usage()
+            except Exception:
+                log.exception("writing the usage counts failed")
+
+    threading.Thread(target=usage_loop, name="usage", daemon=True).start()
+
+    @app.post("/api/usage")
+    async def post_usage(request: Request):
+        if not usage_limiter.allow(client_ip(request)):
+            raise ApiError(429, "too many usage reports from here")
+        body = await read_json(request, USAGE_BODY_BYTES)
+        counts = body.get("counts")
+        if not isinstance(counts, dict):
+            raise ApiError(400, "counts must be an object")
+        platform = body.get("platform")
+        platform = platform if platform in USAGE_PLATFORMS else "other"
+        version = body.get("version")
+        version = version if isinstance(version, str) and USAGE_VERSION_RE.match(version) else "other"
+        day = usage_day()
+        for key, n in counts.items():
+            limit = USAGE_KEYS.get(key)
+            if limit is None or isinstance(n, bool) or not isinstance(n, (int, float)):
+                continue
+            if not math.isfinite(n) or n < 1:
+                continue
+            usage_add(day, platform, version, key, min(int(n), limit))
+        return {"ok": True}
+
+    # --- live channels: how many are watching ---
+    #
+    # A device watching one of the app's live channels says so once a minute, with the
+    # channel and a random pass it made up when it tuned in and forgets when it leaves. The
+    # passes are held in memory only, each for two and a half beats, and the number of them
+    # is the number watching. Nothing ties a pass to an account, a device, or the next one
+    # the same device makes. The answer carries the count, so a viewer asks nothing more;
+    # the guide asks for every channel's count in one request, which a cache may answer for
+    # half a minute. LIVE_EVERY_S sets the pace, and 0 turns the whole thing off, for apps
+    # already out there: each answer tells the app when to come back.
+
+    live_every = settings.live_every_s
+    live_ttl = live_every * 2.5
+    live_beat_limiter = TokenBucket(capacity=30, per_seconds=60)   # per IP
+    live_read_limiter = TokenBucket(capacity=30, per_seconds=60)   # per IP
+    live_lock = threading.Lock()
+    # channel -> pass -> (when it lapses, when it last counted a minute, the address it came from)
+    live_passes: dict[str, dict[str, tuple[float, float, str]]] = {}
+    live_counts: dict[str, tuple[int, float]] = {}
+
+    def live_count(channel: str, t: float) -> int:
+        """How many are watching `channel`. Call with live_lock held."""
+        known = live_counts.get(channel)
+        if known and t - known[1] < LIVE_COUNT_S:
+            return known[0]
+        passes = live_passes.get(channel) or {}
+        per_ip: dict[str, int] = {}
+        for token, (lapses, _, ip) in list(passes.items()):
+            if lapses <= t:
+                del passes[token]
+            else:
+                per_ip[ip] = per_ip.get(ip, 0) + 1
+        n = sum(min(c, LIVE_PER_IP) for c in per_ip.values())
+        live_counts[channel] = (n, t)
+        return n
+
+    def live_now() -> dict[str, int]:
+        t = monotonic()
+        with live_lock:
+            return {ch: live_count(ch, t) for ch in (*LIVE_CHANNELS, "other")}
+
+    @app.post("/api/live/watching")
+    async def live_watching(request: Request):
+        ip = client_ip(request)
+        if not live_beat_limiter.allow(ip):
+            raise ApiError(429, "slow down")
+        body = await read_json(request, 500)
+        token = body.get("token")
+        if not isinstance(token, str) or not LIVE_TOKEN_RE.match(token):
+            raise ApiError(400, "token is required")
+        if not live_every:
+            return {"watching": 0, "every": 0}
+        channel = body.get("channel")
+        channel = channel if channel in LIVE_CHANNELS else "other"
+        t = monotonic()
+        with live_lock:
+            passes = live_passes.setdefault(channel, {})
+            held = passes.get(token)
+            if body.get("leave") is True:
+                if held:
+                    del passes[token]
+                    live_counts.pop(channel, None)
+                return {"ok": True}
+            if not held and len(passes) >= LIVE_MAX_TOKENS:
+                raise ApiError(503, "busy")
+            # A minute watched is counted for a new pass, and then once for each beat that
+            # comes about on time: beating faster adds nothing.
+            minute = not held or t - held[1] >= live_every * 0.75
+            passes[token] = (t + live_ttl, t if minute else held[1], ip)
+            if not held:
+                live_counts.pop(channel, None)
+            n = live_count(channel, t)
+        day = usage_day()
+        if minute:
+            usage_add(day, "all", "", f"live.mins.{channel}", max(1, round(live_every / 60)))
+        with usage_lock:
+            k = (day, "all", "", f"live.peak.{channel}")
+            usage_peaks[k] = max(usage_peaks.get(k, 0), n)
+        return {"watching": n if n >= LIVE_SHOW_FROM else 0, "every": live_every}
+
+    @app.get("/api/live/viewers")
+    async def live_viewers(request: Request):
+        if not live_read_limiter.allow(client_ip(request)):
+            raise ApiError(429, "slow down")
+        viewers = {ch: n for ch, n in live_now().items() if n >= LIVE_SHOW_FROM and ch != "other"} if live_every else {}
+        # The same for everyone, so a cache in front may answer for half a minute.
+        return JSONResponse({"viewers": viewers, "every": live_every},
+                            headers={"Cache-Control": "public, max-age=30"})
+
+    # --- the counts, for whoever runs this ---
+
+    stats_on = len(settings.stats_token) >= 24
+    if settings.stats_token and not stats_on:
+        log.warning("STATS_TOKEN is shorter than 24 characters: the stats page is off")
+    stats_limiter = TokenBucket(capacity=30, per_seconds=60)  # per IP, right or wrong
+    stats_page_html = (STATIC_DIR / "stats.html").read_text(encoding="utf-8")
+
+    @app.get("/stats", include_in_schema=False)
+    async def stats_page():
+        if not stats_on:
+            raise ApiError(404, "not found")
+        # The page holds no numbers: it asks /api/stats for them with the password typed into it.
+        return HTMLResponse(stats_page_html, headers={
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                                       "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "Cache-Control": "no-store",
+            "X-Robots-Tag": "noindex",
+        })
+
+    @app.get("/api/stats")
+    async def get_stats(request: Request, days: int = 30):
+        if not stats_on:
+            raise ApiError(404, "not found")
+        if not stats_limiter.allow(client_ip(request)):
+            raise ApiError(429, "slow down")
+        scheme, _, given = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(given.strip().encode(), settings.stats_token.encode()):
+            raise ApiError(401, "wrong password")
+        days = max(1, min(USAGE_STATS_DAYS, days))
+        since = time.strftime("%Y-%m-%d", time.gmtime(now_ms() / 1000 - (days - 1) * 86400))
+
+        def read():
+            flush_usage()
+            with db.connect() as conn:
+                return [list(r) for r in conn.execute(
+                    "SELECT day, platform, version, key, n FROM usage WHERE day >= ? ORDER BY day", (since,))]
+
+        rows = await run_in_threadpool(read)
+        return {"today": usage_day(), "since": since, "rows": rows, "watching": live_now()}
 
     return app
 
