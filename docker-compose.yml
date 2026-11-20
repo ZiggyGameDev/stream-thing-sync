@@ -24,6 +24,8 @@ services:
       STATS_TOKEN: ${STATS_TOKEN:-}
       # How often a device watching a live channel says so, seconds. 0: viewer counts off.
       LIVE_EVERY_S: ${LIVE_EVERY_S:-60}
+      # 0: don't look titles up (name, year, genres) for the stats pages.
+      TITLE_LOOKUP: ${TITLE_LOOKUP:-1}
       PUBLIC_URL: ${PUBLIC_URL:-https://sync.thestoreisclosed.co.uk}
       DATA_DIR: /data
       TZ: ${TZ:-Europe/London}

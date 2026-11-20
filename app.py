@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -153,6 +154,16 @@ USAGE_KEYS: dict[str, int] = {
 }
 USAGE_FLUSH_S = 60
 USAGE_STATS_DAYS = 400
+
+# What is watched, for the stats pages: added up from the watch progress accounts sync.
+# Titles are named by a public catalogue, a few at a time, and remembered.
+TITLE_META_URL = "https://v3-cinemeta.strem.io"
+TITLE_META_KITSU = "https://anime-kitsu.strem.fun"
+TITLE_LOOKUPS_PER_PASS = 400
+TITLE_RETRY_S = 7 * 86400       # a title nothing knew is asked about again this often
+TITLE_LOOP_S = 900
+WATCHING_CACHE_S = 60
+WATCHING_TOP = 300              # titles sent to the page, by hours watched
 
 # Live channels: how many are watching each. Only the app's own channels are told apart; a
 # key this server doesn't know (a channel newer than it) is counted under "other".
@@ -283,6 +294,55 @@ def github_api(method: str, path: str, token: str, payload: dict | None = None) 
         return r.json()
     except ValueError:
         raise GitHubError(r.status_code, "GitHub answered with something that isn't JSON") from None
+
+
+def title_of(video_id: str) -> tuple[str, str]:
+    """A progress entry's title and what kind of thing was watched: ("tt0903747", "episode").
+    An episode's id is its show's id and then the season and episode (tt…:1:2, kitsu:7442:3)."""
+    parts = video_id.split(":")
+    if parts[0].startswith("tt"):
+        return parts[0], "episode" if len(parts) > 1 else "film"
+    if len(parts) >= 3:
+        return ":".join(parts[:2]), "episode"
+    return video_id, "other"
+
+
+def fetch_title_meta(kind: str, title_id: str) -> dict | None:
+    """What a public catalogue says about one title: name, year, genres. None when it
+    doesn't know it; raises when it couldn't be asked. Tests monkeypatch this."""
+    import requests
+
+    host = TITLE_META_KITSU if title_id.startswith("kitsu:") else TITLE_META_URL
+    r = requests.get(f"{host}/meta/{kind}/{title_id}.json", timeout=15, headers={"User-Agent": "stream-thing-sync"})
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    meta = r.json().get("meta") or {}
+    name = meta.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    year = re.search(r"\d{4}", str(meta.get("year") or meta.get("releaseInfo") or meta.get("released") or ""))
+    genres = meta.get("genres") or meta.get("genre") or []
+    country = str(meta.get("country") or "").split(",")[0].strip()
+    try:
+        rating = float(meta.get("imdbRating"))
+    except (TypeError, ValueError):
+        rating = None
+    return {
+        "name": name.strip()[:200],
+        "year": int(year.group()) if year else None,
+        "genres": [g[:40] for g in genres if isinstance(g, str)][:8],
+        "country": country[:60] or None,
+        "rating": rating,
+    }
+
+
+def _uk_zone():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Europe/London")
+    except Exception:  # no time zone data on this machine: UTC is close enough
+        return None
 
 
 # What the person typed is the one part of an issue a stranger wrote. It must not be able
@@ -449,6 +509,8 @@ class Settings:
     github_repo: str = ""
     # The password for /stats (the usage counts). Unset: there is no stats page.
     stats_token: str = ""
+    # Look titles up (name, year, genres) for the stats pages. Off in tests: it asks another server.
+    title_lookup: bool = False
     # How often a device watching a live channel says so, seconds. 0: live viewer counts off.
     live_every_s: int = 60
 
@@ -470,6 +532,7 @@ class Settings:
             github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
             github_repo=os.environ.get("GITHUB_REPO", "").strip().strip("/"),
             stats_token=os.environ.get("STATS_TOKEN", "").strip(),
+            title_lookup=os.environ.get("TITLE_LOOKUP", "1").strip() != "0",
             live_every_s=_live_every(os.environ.get("LIVE_EVERY_S", "")),
         )
 
@@ -584,6 +647,16 @@ CREATE TABLE IF NOT EXISTS usage (
     key      TEXT NOT NULL,       -- what was counted (USAGE_KEYS, live.mins.*, live.peak.*)
     n        INTEGER NOT NULL,
     PRIMARY KEY (day, platform, version, key)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS titles (
+    id         TEXT PRIMARY KEY,  -- a film's or a show's id, as progress has it (less the episode)
+    type       TEXT,              -- movie or series; NULL when nothing knew it
+    name       TEXT,
+    year       INTEGER,
+    genres     TEXT,              -- JSON list
+    country    TEXT,
+    rating     REAL,              -- IMDb's score
+    fetched_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 """
 
@@ -2339,13 +2412,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The page holds no numbers: it asks /api/stats for them with the password typed into it.
         return HTMLResponse(stats_page_html, headers={
             "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-                                       "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                                       "connect-src 'self'; img-src https://images.metahub.space; "
+                                       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
             "Cache-Control": "no-store",
             "X-Robots-Tag": "noindex",
         })
 
-    @app.get("/api/stats")
-    async def get_stats(request: Request, days: int = 30):
+    def stats_auth(request: Request) -> None:
         if not stats_on:
             raise ApiError(404, "not found")
         if not stats_limiter.allow(client_ip(request)):
@@ -2353,6 +2426,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         scheme, _, given = request.headers.get("authorization", "").partition(" ")
         if scheme.lower() != "bearer" or not hmac.compare_digest(given.strip().encode(), settings.stats_token.encode()):
             raise ApiError(401, "wrong password")
+
+    @app.get("/api/stats")
+    async def get_stats(request: Request, days: int = 30):
+        stats_auth(request)
         days = max(1, min(USAGE_STATS_DAYS, days))
         since = time.strftime("%Y-%m-%d", time.gmtime(now_ms() / 1000 - (days - 1) * 86400))
 
@@ -2364,6 +2441,233 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         rows = await run_in_threadpool(read)
         return {"today": usage_day(), "since": since, "rows": rows, "watching": live_now()}
+
+    # --- what is watched, for whoever runs this ---
+    #
+    # Added up from the watch progress and My list that signed-in accounts sync: which
+    # titles, kinds, genres and years are watched, when, how far through, and by how many
+    # accounts. Only totals leave here: never an account, an email or one person's history.
+    # (With a handful of accounts a total can still be one person's; that is what the
+    # password is for.) Titles are named by a public catalogue, asked about the title alone.
+
+    titles_wake = threading.Event()
+    titles_lock = threading.Lock()
+    watching_cache: dict[int, tuple[float, dict]] = {}
+    uk = _uk_zone()
+
+    def lookup_titles(limit: int = TITLE_LOOKUPS_PER_PASS) -> int:
+        """Ask the catalogue about titles not yet named; how many were asked about."""
+        with titles_lock:
+            now_s = now_ms() // 1000
+            with db.connect() as conn:
+                known = {r["id"]: r for r in conn.execute("SELECT id, name, fetched_at FROM titles")}
+                wanted: dict[str, str] = {}
+                for (video_id,) in conn.execute("SELECT DISTINCT video_id FROM progress"):
+                    base, kind = title_of(video_id)
+                    if kind != "other":
+                        wanted.setdefault(base, "series" if kind == "episode" else "movie")
+                for r in conn.execute("SELECT DISTINCT title_id, type FROM list_items"):
+                    if r["type"] in ("movie", "series"):
+                        wanted.setdefault(r["title_id"], r["type"])
+            todo = [(i, k) for i, k in wanted.items()
+                    if i not in known or (known[i]["name"] is None and now_s - known[i]["fetched_at"] > TITLE_RETRY_S)]
+            asked = 0
+            for title_id, kind in todo[:limit]:
+                meta, found = None, None
+                try:
+                    # A film's id and a show's look alike: the likelier kind first, then the other.
+                    for k in (kind, "movie" if kind == "series" else "series"):
+                        meta = fetch_title_meta(k, title_id)
+                        if meta:
+                            found = k
+                            break
+                except Exception as exc:
+                    log.warning("title lookup stopped: %s", type(exc).__name__)
+                    break
+                asked += 1
+                with db.connect() as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO titles (id, type, name, year, genres, country, rating, fetched_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (title_id, found, meta and meta["name"], meta and meta["year"],
+                         json.dumps(meta["genres"]) if meta else None, meta and meta["country"], meta and meta["rating"], now_s))
+            if asked:
+                watching_cache.clear()
+            return asked
+
+    app.state.lookup_titles = lookup_titles
+
+    def titles_loop():
+        while True:
+            try:
+                while lookup_titles() >= TITLE_LOOKUPS_PER_PASS:
+                    pass
+            except Exception:
+                log.exception("looking titles up failed")
+            titles_wake.wait(TITLE_LOOP_S)
+            titles_wake.clear()
+
+    if settings.title_lookup and stats_on:
+        threading.Thread(target=titles_loop, name="titles", daemon=True).start()
+
+    def watching(days: int) -> dict:
+        now = now_ms()
+        since = now - days * 86_400_000 if days else 0
+        week = 7 * 86_400_000
+        with db.connect() as conn:
+            rows = conn.execute("SELECT user_id, video_id, position, duration, watched, updated_at FROM progress").fetchall()
+            meta = {r["id"]: r for r in conn.execute("SELECT * FROM titles")}
+            listed = conn.execute("SELECT user_id, title_id, type, name, added_at FROM list_items WHERE removed = 0").fetchall()
+            accounts = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            devices = [r[0] for r in conn.execute("SELECT name FROM devices")]
+            profiles = conn.execute("SELECT COUNT(*) FROM profiles WHERE removed = 0").fetchone()[0]
+        list_names = {r["title_id"]: (r["name"], r["type"]) for r in listed if r["name"]}
+
+        def describe(title_id: str, kind: str) -> dict:
+            m = meta.get(title_id)
+            name, kind_listed = list_names.get(title_id, (None, None))
+            return {
+                "id": title_id,
+                "type": (m and m["type"]) or kind_listed or ("series" if kind == "episode" else "movie"),
+                "name": (m and m["name"]) or name or title_id,
+                "year": m and m["year"],
+                "genres": json.loads(m["genres"]) if m and m["genres"] else [],
+                "country": m and m["country"],
+                "rating": m and m["rating"],
+            }
+
+        titles: dict[str, dict] = {}
+        kinds: dict[str, dict] = {}
+        daily: dict[str, dict] = {}
+        heat = [[0] * 24 for _ in range(7)]
+        completion = [0] * 10
+        active: set[int] = set()
+        entries = finished = 0
+        hours_all = 0.0
+        for r in rows:
+            at = r["updated_at"]
+            base, kind = title_of(r["video_id"])
+            t = titles.get(base)
+            if t is None:
+                t = titles[base] = {**describe(base, kind), "kind": kind, "viewers": set(), "plays": 0, "finished": 0,
+                                    "hours": 0.0, "episodes": set(), "last": 0, "recent": 0, "before": 0, "ever": set()}
+            t["ever"].add(r["user_id"])
+            # Lately, whatever the period asked for: what is on the way up.
+            if at >= now - week:
+                t["recent"] += 1
+            elif at >= now - 2 * week:
+                t["before"] += 1
+            if at < since:
+                continue
+            duration, position = r["duration"] or 0, r["position"] or 0
+            seen = duration if r["watched"] and duration else min(position, duration) if duration else position
+            # A device with a wild clock or a broken file shouldn't add a year of viewing.
+            hours = min(max(seen, 0), 6 * 3600) / 3600
+            entries += 1
+            hours_all += hours
+            finished += 1 if r["watched"] else 0
+            active.add(r["user_id"])
+            t["viewers"].add(r["user_id"])
+            t["plays"] += 1
+            t["finished"] += 1 if r["watched"] else 0
+            t["hours"] += hours
+            t["last"] = max(t["last"], at)
+            if kind == "episode":
+                t["episodes"].add(r["video_id"])
+            k = kinds.setdefault(kind, {"kind": kind, "viewers": set(), "plays": 0, "hours": 0.0})
+            k["viewers"].add(r["user_id"])
+            k["plays"] += 1
+            k["hours"] += hours
+            if duration > 0:
+                completion[9 if r["watched"] else min(9, int(max(position, 0) / duration * 10))] += 1
+            # A device's clock decides `at`: one far off is left out of the calendar.
+            if not 0 < at <= now + 2 * 86_400_000:
+                continue
+            when = datetime.fromtimestamp(at / 1000, uk or timezone.utc)
+            d = daily.setdefault(when.strftime("%Y-%m-%d"), {"plays": 0, "accounts": set(), "hours": 0.0})
+            d["plays"] += 1
+            d["accounts"].add(r["user_id"])
+            d["hours"] += hours
+            heat[when.weekday()][when.hour] += 1
+
+        watched = [t for t in titles.values() if t["plays"]]
+        genres: dict[str, dict] = {}
+        decades: dict[int, dict] = {}
+        countries: dict[str, dict] = {}
+        ratings = [0] * 10
+        for t in watched:
+            for g in t["genres"]:
+                e = genres.setdefault(g, {"genre": g, "viewers": set(), "plays": 0, "hours": 0.0, "titles": 0})
+                e["viewers"] |= t["viewers"]
+                e["plays"] += t["plays"]
+                e["hours"] += t["hours"]
+                e["titles"] += 1
+            if t["year"]:
+                e = decades.setdefault(t["year"] // 10 * 10, {"decade": t["year"] // 10 * 10, "plays": 0, "hours": 0.0, "titles": 0})
+                e["plays"] += t["plays"]
+                e["hours"] += t["hours"]
+                e["titles"] += 1
+            if t["country"]:
+                e = countries.setdefault(t["country"], {"country": t["country"], "plays": 0, "hours": 0.0, "titles": 0})
+                e["plays"] += t["plays"]
+                e["hours"] += t["hours"]
+                e["titles"] += 1
+            if t["rating"]:
+                ratings[min(9, int(t["rating"]))] += 1
+
+        def out(t: dict) -> dict:
+            return {**{k: t[k] for k in ("id", "type", "name", "year", "genres", "kind", "plays", "finished", "last", "recent", "before")},
+                    "viewers": len(t["viewers"]), "hours": round(t["hours"], 2), "episodes": len(t["episodes"])}
+
+        adds: dict[str, dict] = {}
+        for r in listed:
+            e = adds.setdefault(r["title_id"], {**describe(r["title_id"], "episode" if r["type"] == "series" else "film"), "adds": 0})
+            e["adds"] += 1
+        for e in adds.values():
+            e["watched_by"] = len(titles[e["id"]]["ever"]) if e["id"] in titles else 0
+            for k in ("genres", "country", "rating"):
+                e.pop(k)
+
+        device_kinds: dict[str, int] = {}
+        for name in devices:
+            kind = name.split(" · ")[0]
+            device_kinds[kind] = device_kinds.get(kind, 0) + 1
+
+        with_counts = lambda items: [{**e, "viewers": len(e["viewers"]), "hours": round(e["hours"], 2)} for e in items]
+        rounded = lambda items: [{**e, "hours": round(e["hours"], 2)} for e in items]
+        return {
+            "now": now,
+            "since": since,
+            "totals": {"accounts": accounts, "active": len(active), "devices": len(devices), "profiles": profiles,
+                       "plays": entries, "finished": finished, "hours": round(hours_all, 1), "titles": len(watched),
+                       "named": sum(1 for t in watched if t["id"] in meta and meta[t["id"]]["name"])},
+            "kinds": with_counts(kinds.values()),
+            "titles": [out(t) for t in sorted(watched, key=lambda t: -t["hours"])[:WATCHING_TOP]],
+            "rising": [out(t) for t in sorted((t for t in titles.values() if t["recent"] > t["before"]),
+                                              key=lambda t: t["before"] - t["recent"])[:20]],
+            "genres": with_counts(genres.values()),
+            "decades": rounded(sorted(decades.values(), key=lambda e: e["decade"])),
+            "countries": rounded(sorted(countries.values(), key=lambda e: -e["hours"])[:20]),
+            "ratings": ratings,
+            "daily": [{"day": day, "plays": d["plays"], "accounts": len(d["accounts"]), "hours": round(d["hours"], 2)}
+                      for day, d in sorted(daily.items())],
+            "heat": heat,
+            "completion": completion,
+            "list": sorted(adds.values(), key=lambda e: -e["adds"])[:100],
+            "devices": [{"kind": k, "n": n} for k, n in sorted(device_kinds.items(), key=lambda kv: -kv[1])],
+        }
+
+    @app.get("/api/stats/watching")
+    async def get_watching(request: Request, days: int = 30):
+        """`days`: how far back, by when each entry was last watched. 0: everything."""
+        stats_auth(request)
+        days = max(0, min(3650, days))
+        titles_wake.set()
+        cached = watching_cache.get(days)
+        if cached and monotonic() - cached[0] < WATCHING_CACHE_S:
+            return cached[1]
+        result = await run_in_threadpool(watching, days)
+        watching_cache[days] = (monotonic(), result)
+        return result
 
     return app
 

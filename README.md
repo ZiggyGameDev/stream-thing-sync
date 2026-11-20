@@ -285,6 +285,16 @@ device's first report of a day, week and month carries `active.day`, `active.wee
 
 `/stats` is the page that shows it all, behind `STATS_TOKEN`.
 
+**What is watched.** `GET /api/stats/watching?days=30` (same password; `days=0` for
+everything) adds up the watch progress and My list that signed-in accounts sync: top
+titles, shows against films, genres, decades, countries, IMDb scores, plays by day and by
+hour (UK time), how far through people get, what is on the way up, what is saved and never
+started, and signed-in devices by kind. Only totals leave the server, never an account or
+one person's history; with a handful of accounts a total can still be one person's, which
+is what the password is for. Titles are named from Cinemeta (and the Kitsu addon for anime),
+asked about the title's id alone, a few hundred at a time, and kept in the `titles` table;
+`TITLE_LOOKUP=0` turns the lookups off. The privacy page says all of this.
+
 To let Cloudflare answer the guide's requests, add a Cache Rule for
 `/api/live/viewers` (eligible for cache, respect origin TTL). Without it they reach this
 server, where each is a read from memory.

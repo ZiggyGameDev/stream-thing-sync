@@ -5,223 +5,580 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta name="robots" content="noindex">
-<title>Usage · stream-thing sync</title>
+<title>Stats · stream-thing sync</title>
 <style>
-  :root { --bg: #0e0f13; --panel: #171920; --line: #2a2e3a; --text: #e8e9ee; --muted: #9096a6; --accent: #7c8cff; }
+  /* Dark only. Chart colours are the validated dark steps: the three series hues pass the
+     colour-blind checks against --surface as a set, and the heat ramp is one hue. */
+  :root {
+    --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  }
   * { box-sizing: border-box; }
-  html, body { margin: 0; background: var(--bg); color: var(--text); }
-  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 24px 16px 48px; }
-  main { max-width: 1040px; margin: 0 auto; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  h1 span { color: var(--accent); }
-  h2 { font-size: 15px; margin: 0 0 10px; }
-  p { margin: 0 0 10px; }
-  .muted { color: var(--muted); font-size: 13px; }
-  .bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 16px 0; }
-  input, select, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
-  input { flex: 1; min-width: 180px; }
-  button { cursor: pointer; background: var(--accent); border-color: var(--accent); color: #0e0f13; font-weight: 600; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; overflow-x: auto; }
+  html, body { margin: 0; background: var(--plane); color: var(--ink); }
+  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 20px 16px 56px; }
+  main { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0; }
+  p { margin: 0; }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .top { display: flex; gap: 10px 16px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  .top h1 { margin-right: auto; }
+  input, select, button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button.go { background: var(--s1); border-color: var(--s1); color: #fff; font-weight: 600; }
+  :is(input, select, button, [tabindex]):focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .filters label { color: var(--muted); font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--grid); margin-bottom: 16px; }
+  nav button { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 12px; color: var(--ink-2); }
+  nav button[aria-selected=true] { color: var(--ink); border-bottom-color: var(--s1); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+  .card { grid-column: span 6; background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 16px; min-width: 0; }
   .card.wide { grid-column: 1 / -1; }
+  .card.third { grid-column: span 4; }
+  @media (max-width: 860px) { .card, .card.third { grid-column: 1 / -1; } }
+  .card-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 12px; }
+  .card-head .muted { flex: 1; }
+  .card-head button { font-size: 12px; padding: 2px 8px; color: var(--ink-2); }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 14px; }
-  .tile b { display: block; font-size: 26px; line-height: 1.2; font-variant-numeric: tabular-nums; }
-  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th:first-child, td:first-child { text-align: left; }
-  th { color: var(--muted); font-weight: 500; font-size: 12.5px; }
+  .tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; }
+  .tile b { display: block; font-size: 26px; font-weight: 600; line-height: 1.2; }
+  .tile.hero b { font-size: 48px; }
+  .tile span { color: var(--ink-2); font-size: 13px; }
+  .tile small { display: block; color: var(--muted); font-size: 12px; }
+  /* Ranked bars: one colour, thin, the value at the tip. */
+  .rank { display: grid; grid-template-columns: minmax(90px, 38%) 1fr; gap: 6px 12px; align-items: center; }
+  .rank .name { display: flex; gap: 8px; align-items: center; min-width: 0; }
+  .rank .name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rank .name small { color: var(--muted); flex: none; }
+  .rank img { width: 22px; height: 33px; object-fit: cover; border-radius: 3px; flex: none; background: var(--grid); }
+  .rank .track { display: flex; align-items: center; gap: 8px; min-width: 0; border-radius: 4px; }
+  .rank .bar { height: 12px; min-width: 2px; background: var(--s1); border-radius: 0 4px 4px 0; flex: none; }
+  .rank .val { color: var(--ink-2); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .rank .track:hover .bar, .rank .track:focus-visible .bar { filter: brightness(1.25); }
+  /* One whole in parts. */
+  .seg { display: flex; gap: 2px; height: 28px; }
+  .seg div { border-radius: 4px; color: #fff; font-size: 12.5px; font-weight: 600; padding: 0 8px; line-height: 28px; overflow: hidden; white-space: nowrap; min-width: 3px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; color: var(--ink-2); font-size: 12.5px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; }
+  svg { display: block; width: 100%; overflow: visible; }
+  svg text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  svg .gridline { stroke: var(--grid); stroke-width: 1; }
+  svg .axis { stroke: var(--axis); stroke-width: 1; }
+  svg .col { fill: var(--s1); }
+  svg .hit { fill: transparent; }
+  svg .hit:hover + .col, svg .hit:focus + .col { filter: brightness(1.25); }
+  svg .line { fill: none; stroke: var(--s1); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  svg .wash { fill: var(--s1); opacity: .1; }
+  svg .dot { fill: var(--s1); stroke: var(--surface); stroke-width: 2; }
+  svg .cross { stroke: var(--axis); stroke-width: 1; }
+  .heat { display: grid; grid-template-columns: 34px repeat(24, 1fr); gap: 2px; font-size: 11px; color: var(--muted); }
+  .heat .cell { aspect-ratio: 1; border-radius: 3px; min-height: 12px; }
+  .heat .hour { text-align: center; }
+  .scale { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+  .scale i { width: 18px; height: 10px; border-radius: 2px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 13px; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; white-space: normal; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
   tr:last-child td { border-bottom: 0; }
-  #error { color: #ff8f8f; }
+  .scroll { overflow-x: auto; max-height: 520px; overflow-y: auto; }
+  .empty { color: var(--muted); padding: 18px 0; }
+  #tip { position: fixed; z-index: 9; pointer-events: none; background: #000; border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px; font-size: 12.5px; max-width: 280px; display: none; }
+  #tip b { display: block; }
+  #tip span { color: var(--ink-2); }
+  #error { color: #e66767; margin-bottom: 10px; }
+  #out.stale { opacity: .5; }
 </style>
 </head>
 <body>
 <main>
-  <h1>stream-thing <span>usage</span></h1>
-  <p class="muted">Anonymous counts, added up per day (UTC). A device reports once a day, so what it did shows up on the day it next opens the app.</p>
-  <form class="bar" id="form">
-    <input id="token" type="password" placeholder="Stats password" autocomplete="off" aria-label="Stats password">
-    <select id="days" aria-label="Period">
-      <option value="7">Last 7 days</option>
-      <option value="30" selected>Last 30 days</option>
-      <option value="90">Last 90 days</option>
-      <option value="365">Last year</option>
-    </select>
-    <button type="submit">Show</button>
+  <form class="top" id="form">
+    <h1>DizziTV stats</h1>
+    <div class="filters">
+      <input id="token" type="password" placeholder="Stats password" autocomplete="off" aria-label="Stats password">
+      <label>Period
+        <select id="days">
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="365">Last year</option>
+          <option value="0">All time</option>
+        </select>
+      </label>
+      <label>Measure by
+        <select id="metric">
+          <option value="hours" selected>Hours watched</option>
+          <option value="viewers">Accounts</option>
+          <option value="plays">Plays</option>
+        </select>
+      </label>
+      <button class="go" type="submit">Show</button>
+    </div>
   </form>
   <p id="error"></p>
+  <nav id="tabs" role="tablist"></nav>
   <div id="out"></div>
 </main>
+<div id="tip" role="status"></div>
 <script>
 (function () {
-  var form = document.getElementById('form');
-  var tokenBox = document.getElementById('token');
-  var out = document.getElementById('out');
-  var error = document.getElementById('error');
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var form = $('form'), tokenBox = $('token'), out = $('out'), error = $('error'), tip = $('tip');
   try { tokenBox.value = sessionStorage.getItem('stats-token') || ''; } catch (e) {}
 
-  function el(tag, text, cls) {
+  var TABS = [['overview', 'Overview'], ['titles', 'Titles'], ['genres', 'Genres and eras'], ['when', 'When'],
+    ['finishing', 'Finishing'], ['list', 'My list'], ['app', 'App usage'], ['live', 'Live channels']];
+  var KIND = { episode: ['Shows', 'var(--s1)'], film: ['Films', 'var(--s2)'], other: ['Other', 'var(--s3)'] };
+  var HEAT = ['#0d366b', '#184f95', '#256abf', '#3987e5', '#6da7ec', '#b7d3f6'];
+  var DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  var data = null, tab = (location.hash || '#overview').slice(1), draws = [];
+  if (!TABS.some(function (t) { return t[0] === tab; })) tab = 'overview';
+
+  // ------------------------------------------------------------ small things ----
+  function el(tag, cls, text) {
     var n = document.createElement(tag);
-    if (text !== undefined) n.textContent = String(text);
     if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
     return n;
   }
-  var num = function (n) { return Math.round(n).toLocaleString('en-GB'); };
-  var hours = function (mins) { return (mins / 60).toLocaleString('en-GB', { maximumFractionDigits: 1 }); };
-  var share = function (n, of) { return of ? Math.round((n / of) * 100) + '%' : ''; };
+  function svg(tag, attrs) {
+    var n = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (var k in attrs) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  var num = function (n) { return n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'K' : Math.round(n).toLocaleString('en-GB'); };
+  var hrs = function (h) { return (h >= 100 ? Math.round(h).toLocaleString('en-GB') : (Math.round(h * 10) / 10).toLocaleString('en-GB')) + ' h'; };
+  var pct = function (n, of) { return of ? Math.round((n / of) * 100) + '%' : '-'; };
+  var metric = function () { return $('metric').value; };
+  var METRIC = { hours: 'Hours watched', viewers: 'Accounts', plays: 'Plays' };
+  var fmt = function (v, m) { return (m || metric()) === 'hours' ? hrs(v) : num(v); };
+  var sum = function (list, f) { return list.reduce(function (a, x) { return a + f(x); }, 0); };
+  var top = function (list, f, n) { return list.slice().sort(function (a, b) { return f(b) - f(a); }).slice(0, n || 15); };
+  var poster = function (t) { return /^tt\d+$/.test(t.id) ? 'https://images.metahub.space/poster/small/' + t.id + '/img' : ''; };
+  var titled = function (t) { return t.name + (t.year ? ' (' + t.year + ')' : ''); };
 
+  function showTip(e, title, lines) {
+    tip.textContent = '';
+    tip.appendChild(el('b', '', title));
+    (lines || []).forEach(function (l) { tip.appendChild(el('span', '', l)); tip.appendChild(el('br')); });
+    tip.style.display = 'block';
+    var r = e.target.getBoundingClientRect();
+    var x = e.clientX || r.left + r.width / 2, y = e.clientY || r.top;
+    tip.style.left = Math.max(8, Math.min(window.innerWidth - tip.offsetWidth - 8, x + 12)) + 'px';
+    tip.style.top = Math.max(8, y - tip.offsetHeight - 10) + 'px';
+  }
+  function hideTip() { tip.style.display = 'none'; }
+  function hover(node, title, lines) {
+    node.addEventListener('mousemove', function (e) { showTip(e, title, lines); });
+    node.addEventListener('focus', function (e) { showTip(e, title, lines); });
+    node.addEventListener('mouseleave', hideTip);
+    node.addEventListener('blur', hideTip);
+    node.setAttribute('aria-label', title + ': ' + (lines || []).join(', '));
+  }
+
+  // ------------------------------------------------------------- the pieces ----
   function table(head, rows) {
-    var t = el('table');
-    var hr = el('tr');
-    head.forEach(function (h) { hr.appendChild(el('th', h)); });
+    var wrap = el('div', 'scroll'), t = el('table'), hr = el('tr');
+    head.forEach(function (h) { hr.appendChild(el('th', '', h)); });
     t.appendChild(hr);
-    rows.forEach(function (r) {
-      var tr = el('tr');
-      r.forEach(function (c) { tr.appendChild(el('td', c)); });
-      t.appendChild(tr);
-    });
-    if (!rows.length) {
-      var tr = el('tr');
-      var td = el('td', 'Nothing yet', 'muted');
-      td.colSpan = head.length;
-      tr.appendChild(td);
-      t.appendChild(tr);
+    rows.forEach(function (r) { var tr = el('tr'); r.forEach(function (c) { tr.appendChild(el('td', '', c)); }); t.appendChild(tr); });
+    wrap.appendChild(t);
+    return wrap;
+  }
+  /** A card: a chart, and the same numbers as a table behind its button. */
+  function card(title, note, chart, tableSpec, cls) {
+    var c = el('section', 'card' + (cls ? ' ' + cls : '')), head = el('div', 'card-head');
+    head.appendChild(el('h2', '', title));
+    head.appendChild(el('span', 'muted', note || ''));
+    c.appendChild(head);
+    var body = el('div');
+    c.appendChild(body);
+    var empty = !chart || (tableSpec && !tableSpec.rows.length);
+    if (empty) { body.appendChild(el('p', 'empty', 'Nothing in this period yet.')); return c; }
+    body.appendChild(chart);
+    if (tableSpec) {
+      var btn = el('button', '', 'Table'), tbl = null;
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        if (!tbl) { tbl = table(tableSpec.head, tableSpec.rows); c.appendChild(tbl); tbl.hidden = true; }
+        tbl.hidden = !tbl.hidden;
+        body.hidden = !tbl.hidden;
+        btn.textContent = tbl.hidden ? 'Table' : 'Chart';
+      });
+      head.appendChild(btn);
     }
+    return c;
+  }
+  function tile(label, value, small, hero) {
+    var t = el('div', 'tile' + (hero ? ' hero' : ''));
+    t.appendChild(el('b', '', value));
+    t.appendChild(el('span', '', label));
+    if (small) t.appendChild(el('small', '', small));
     return t;
   }
-  function card(title, body, wide) {
-    var c = el('section', undefined, 'card' + (wide ? ' wide' : ''));
-    c.appendChild(el('h2', title));
-    c.appendChild(body);
-    return c;
-  }
-  function tile(label, value) {
-    var c = el('div', undefined, 'card tile');
-    c.appendChild(el('b', value));
-    c.appendChild(el('span', label, 'muted'));
-    return c;
-  }
-
-  function draw(data) {
-    var total = {};          // key -> n over the period
-    var byDay = {};          // day -> key -> n
-    var dayPlatform = {};    // day -> platform -> devices
-    var byVersion = {};      // version -> devices (device-days)
-    var peak = {};           // channel -> most at once
-    var platforms = {};
-    data.rows.forEach(function (r) {
-      var day = r[0], platform = r[1], version = r[2], key = r[3], n = r[4];
-      if (key.indexOf('live.peak.') === 0) {
-        var ch = key.slice(10);
-        peak[ch] = Math.max(peak[ch] || 0, n);
-        return;
+  /** Ranked bars. rows: {label, sub, value, tip[], img}. */
+  function rank(rows, format) {
+    var box = el('div', 'rank'), max = Math.max.apply(null, rows.map(function (r) { return r.value; }).concat([0])) || 1;
+    rows.forEach(function (r) {
+      var name = el('div', 'name');
+      if (r.img !== undefined) {
+        var img = el('img');
+        img.alt = '';
+        img.loading = 'lazy';
+        if (r.img) img.src = r.img;
+        img.addEventListener('error', function () { img.removeAttribute('src'); });
+        name.appendChild(img);
       }
-      total[key] = (total[key] || 0) + n;
-      (byDay[day] = byDay[day] || {})[key] = ((byDay[day] || {})[key] || 0) + n;
-      if (key === 'active.day') {
-        platforms[platform] = true;
-        (dayPlatform[day] = dayPlatform[day] || {})[platform] = ((dayPlatform[day] || {})[platform] || 0) + n;
-        byVersion[version] = (byVersion[version] || 0) + n;
+      name.appendChild(el('span', '', r.label));
+      if (r.sub) name.appendChild(el('small', '', r.sub));
+      name.title = r.label;
+      var track = el('div', 'track'), bar = el('div', 'bar');
+      bar.style.width = 'calc(' + (r.value / max * 100).toFixed(2) + '% - 64px)';
+      track.tabIndex = 0;
+      track.appendChild(bar);
+      track.appendChild(el('span', 'val', format(r.value)));
+      hover(track, r.label, r.tip || [format(r.value)]);
+      box.appendChild(name);
+      box.appendChild(track);
+    });
+    return box;
+  }
+  /** Clean steps for an axis that reaches `max`. */
+  function ticks(max) {
+    if (max <= 0) return [0, 1];
+    var raw = max / 3, pow = Math.pow(10, Math.floor(Math.log10(raw))), step = [1, 2, 5, 10].map(function (m) { return m * pow; }).filter(function (s) { return s >= raw; })[0];
+    var out = [];
+    for (var v = 0; v < max + step - 1e-9; v += step) out.push(Math.round(v * 1e6) / 1e6);
+    return out;
+  }
+  /** Columns, or (many points) a line. points: {label, value, tip[]}. Drawn once it has a width. */
+  function plot(points, format, asLine) {
+    var box = el('div');
+    draws.push(function () {
+      box.textContent = '';
+      var W = Math.max(280, box.clientWidth), H = 190, L = 44, R = 10, T = 10, B = 22;
+      var tk = ticks(Math.max.apply(null, points.map(function (p) { return p.value; }).concat([0])));
+      var top = tk[tk.length - 1], y = function (v) { return T + (H - T - B) * (1 - v / top); };
+      var s = svg('svg', { viewBox: '0 0 ' + W + ' ' + H, height: H, role: 'img' });
+      tk.forEach(function (v) {
+        if (v) s.appendChild(svg('line', { class: 'gridline', x1: L, x2: W - R, y1: y(v), y2: y(v) }));
+        var t = svg('text', { x: L - 6, y: y(v) + 4, 'text-anchor': 'end' });
+        t.textContent = format(v).replace(' h', '');
+        s.appendChild(t);
+      });
+      var n = points.length, band = (W - L - R) / n, every = Math.ceil(n / Math.max(2, Math.floor((W - L - R) / 62)));
+      points.forEach(function (p, i) {
+        if (i % every && i !== n - 1) return;
+        if (i === n - 1 && i % every && (n - 1 - Math.floor((n - 1) / every) * every) * band < 50) return;
+        var t = svg('text', { x: L + band * (i + .5), y: H - 6, 'text-anchor': 'middle' });
+        t.textContent = p.label;
+        s.appendChild(t);
+      });
+      if (asLine && n > 1) {
+        var xy = points.map(function (p, i) { return [L + band * (i + .5), y(p.value)]; });
+        var d = xy.map(function (q, i) { return (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1); }).join(' ');
+        s.appendChild(svg('path', { class: 'wash', d: d + ' L' + xy[n - 1][0] + ' ' + y(0) + ' L' + xy[0][0] + ' ' + y(0) + ' Z' }));
+        s.appendChild(svg('path', { class: 'line', d: d }));
+        var cross = svg('line', { class: 'cross', y1: T, y2: y(0), visibility: 'hidden' }), dot = svg('circle', { class: 'dot', r: 5, visibility: 'hidden' });
+        s.appendChild(cross);
+        s.appendChild(dot);
+        var over = svg('rect', { class: 'hit', x: L, y: T, width: W - L - R, height: H - T - B });
+        over.addEventListener('mousemove', function (e) {
+          var r = s.getBoundingClientRect(), i = Math.max(0, Math.min(n - 1, Math.floor(((e.clientX - r.left) / r.width * W - L) / band)));
+          cross.setAttribute('x1', xy[i][0]); cross.setAttribute('x2', xy[i][0]); cross.setAttribute('visibility', 'visible');
+          dot.setAttribute('cx', xy[i][0]); dot.setAttribute('cy', xy[i][1]); dot.setAttribute('visibility', 'visible');
+          showTip(e, points[i].tipTitle || points[i].label, points[i].tip || [format(points[i].value)]);
+        });
+        over.addEventListener('mouseleave', function () { cross.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); hideTip(); });
+        s.appendChild(over);
+      } else {
+        var w = Math.min(24, Math.max(2, band - 2));
+        points.forEach(function (p, i) {
+          var x = L + band * (i + .5) - w / 2, h = y(0) - y(p.value), r = Math.min(4, w / 2, h);
+          var hit = svg('rect', { class: 'hit', x: L + band * i, y: T, width: band, height: H - T - B, tabindex: 0 });
+          hover(hit, p.tipTitle || p.label, p.tip || [format(p.value)]);
+          s.appendChild(hit);
+          if (h > 0) s.appendChild(svg('path', { class: 'col', d: 'M' + x + ' ' + y(0) + ' V' + (y(p.value) + r) + ' q0 ' + -r + ' ' + r + ' ' + -r + ' H' + (x + w - r) + ' q' + r + ' 0 ' + r + ' ' + r + ' V' + y(0) + ' Z' }));
+        });
       }
+      s.appendChild(svg('line', { class: 'axis', x1: L, x2: W - R, y1: y(0), y2: y(0) }));
+      box.appendChild(s);
     });
-    var get = function (k) { return total[k] || 0; };
-    var days = Object.keys(byDay).sort().reverse();
-    var today = byDay[data.today] || {};
-    // The first report of a week or month is flagged, so the flags since it began add up to its devices.
-    var monday = new Date(data.today + 'T00:00:00Z');
-    monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7));
-    var weekFrom = monday.toISOString().slice(0, 10);
-    var monthFrom = data.today.slice(0, 8) + '01';
-    var week = 0, month = 0;
-    days.forEach(function (d) {
-      if (d >= weekFrom) week += byDay[d]['active.week'] || 0;
-      if (d >= monthFrom) month += byDay[d]['active.month'] || 0;
+    return box;
+  }
+  /** One whole in parts. parts: {label, value, color}. */
+  function segments(parts, format) {
+    var box = el('div'), bar = el('div', 'seg'), legend = el('div', 'legend'), total = sum(parts, function (p) { return p.value; });
+    parts.filter(function (p) { return p.value > 0; }).forEach(function (p) {
+      var d = el('div', '', p.value / total >= .09 ? pct(p.value, total) : '');
+      d.style.flex = p.value + ' 0 0';
+      d.style.background = p.color;
+      d.tabIndex = 0;
+      hover(d, p.label, [format(p.value), pct(p.value, total) + ' of the total']);
+      bar.appendChild(d);
+      var l = el('span');
+      var sw = el('i');
+      sw.style.background = p.color;
+      l.appendChild(sw);
+      l.appendChild(document.createTextNode(p.label));
+      legend.appendChild(l);
     });
-    var watchingNow = Object.keys(data.watching).reduce(function (a, k) { return a + data.watching[k]; }, 0);
+    box.appendChild(bar);
+    box.appendChild(legend);
+    return box;
+  }
+  function heat(grid) {
+    var box = el('div'), g = el('div', 'heat'), max = Math.max.apply(null, grid.map(function (r) { return Math.max.apply(null, r); })) || 1;
+    var shade = function (v) { return v ? HEAT[Math.min(HEAT.length - 1, Math.floor(v / max * HEAT.length - 1e-9))] : 'var(--grid)'; };
+    g.appendChild(el('span'));
+    for (var h = 0; h < 24; h++) g.appendChild(el('span', 'hour', h % 3 ? '' : String(h).padStart(2, '0')));
+    grid.forEach(function (row, d) {
+      g.appendChild(el('span', '', DAYS[d]));
+      row.forEach(function (v, hr) {
+        var c = el('div', 'cell');
+        c.style.background = shade(v);
+        hover(c, DAYS[d] + ' ' + String(hr).padStart(2, '0') + ':00', [num(v) + ' plays']);
+        g.appendChild(c);
+      });
+    });
+    box.appendChild(g);
+    var scale = el('div', 'scale');
+    scale.appendChild(el('span', '', 'Fewer'));
+    HEAT.forEach(function (c) { var i = el('i'); i.style.background = c; scale.appendChild(i); });
+    scale.appendChild(el('span', '', 'More plays (most in one hour: ' + num(max) + ')'));
+    box.appendChild(scale);
+    return box;
+  }
 
-    out.textContent = '';
-    var tiles = el('div', undefined, 'tiles');
-    tiles.appendChild(tile('devices today', num(today['active.day'] || 0)));
-    tiles.appendChild(tile('devices this week', num(week)));
-    tiles.appendChild(tile('devices this month', num(month)));
-    tiles.appendChild(tile('watching live now', num(watchingNow)));
-    out.appendChild(tiles);
-
-    var grid = el('div', undefined, 'grid');
-    var plats = Object.keys(platforms).sort();
-    grid.appendChild(card('Devices per day', table(
-      ['Day', 'Devices', 'New'].concat(plats),
-      days.map(function (d) {
-        return [d, num(byDay[d]['active.day'] || 0), num(byDay[d]['age.new'] || 0)].concat(
-          plats.map(function (p) { return num((dayPlatform[d] || {})[p] || 0); }));
-      })), true));
-
-    var prefix = function (p) {
-      return Object.keys(total).filter(function (k) { return k.indexOf(p) === 0; })
-        .map(function (k) { return [k.slice(p.length), total[k]]; })
-        .sort(function (a, b) { return b[1] - a[1]; });
+  // -------------------------------------------------------------- the pages ----
+  var W = function () { return data.watching; };
+  var titleRow = function (m) {
+    return function (t) {
+      return { label: t.name, sub: t.year || '', img: poster(t), value: t[m],
+        tip: [hrs(t.hours) + ' watched', num(t.viewers) + ' account' + (t.viewers === 1 ? '' : 's'), num(t.plays) + ' plays, ' + num(t.finished) + ' finished'] };
     };
-    var sum = function (list) { return list.reduce(function (a, r) { return a + r[1]; }, 0); };
-
-    var opens = prefix('open.');
-    grid.appendChild(card('Sections opened', table(['Section', 'Times', 'Share'],
-      opens.map(function (r) { return [r[0], num(r[1]), share(r[1], sum(opens))]; }))));
-
-    var kinds = {};
-    ['play.', 'fail.', 'mins.'].forEach(function (p) { prefix(p).forEach(function (r) { kinds[r[0]] = true; }); });
-    var allMins = sum(prefix('mins.'));
-    grid.appendChild(card('What is watched', table(['Kind', 'Plays', 'Failed', 'Hours', 'Share of hours'],
-      Object.keys(kinds).sort(function (a, b) { return get('mins.' + b) - get('mins.' + a); }).map(function (k) {
-        return [k, num(get('play.' + k)), num(get('fail.' + k)), hours(get('mins.' + k)), share(get('mins.' + k), allMins)];
-      }))));
-
-    grid.appendChild(card('Features used', table(['Feature', 'Times'],
-      prefix('use.').map(function (r) { return [r[0], num(r[1])]; }))));
-
-    var devices = get('active.day');
-    grid.appendChild(card('How devices are set up', table(['', 'Device-days', 'Share'],
-      prefix('is.').map(function (r) { return [r[0], num(r[1]), share(r[1], devices)]; }))));
-
-    grid.appendChild(card('How long the app has been installed', table(['Age', 'Device-days', 'Share'],
-      ['new', 'week', 'month', 'quarter', 'older'].map(function (a) {
-        var label = { new: 'first day', week: 'under a week', month: 'under a month', quarter: 'under three months', older: 'three months or more' }[a];
-        return [label, num(get('age.' + a)), share(get('age.' + a), devices)];
-      }))));
-
-    grid.appendChild(card('App versions', table(['Version', 'Device-days', 'Share'],
-      Object.keys(byVersion).sort(function (a, b) { return byVersion[b] - byVersion[a]; }).map(function (v) {
-        return [v || '-', num(byVersion[v]), share(byVersion[v], devices)];
-      }))));
-
-    var chans = {};
-    prefix('live.mins.').forEach(function (r) { chans[r[0]] = true; });
-    Object.keys(peak).concat(Object.keys(data.watching)).forEach(function (c) { chans[c] = true; });
-    grid.appendChild(card('Live channels', table(['Channel', 'Watching now', 'Most at once', 'Viewer-hours'],
-      Object.keys(chans).filter(function (c) { return c !== 'other' || get('live.mins.other') || data.watching.other; })
-        .sort(function (a, b) { return get('live.mins.' + b) - get('live.mins.' + a); }).map(function (c) {
-          return [c, num(data.watching[c] || 0), num(peak[c] || 0), hours(get('live.mins.' + c))];
-        })), true));
-    out.appendChild(grid);
+  };
+  var titleTable = function (list) {
+    return { head: ['Title', 'Kind', 'Hours', 'Accounts', 'Plays', 'Finished', 'Episodes'],
+      rows: list.map(function (t) { return [titled(t), KIND[t.kind] ? KIND[t.kind][0] : t.kind, hrs(t.hours), num(t.viewers), num(t.plays), num(t.finished), t.episodes || '']; }) };
+  };
+  function topTitles(title, note, list, n, cls) {
+    var m = metric(), rows = top(list, function (t) { return t[m]; }, n);
+    return card(title, note || METRIC[m], rank(rows.map(titleRow(m)), function (v) { return fmt(v, m); }), titleTable(rows), cls);
+  }
+  function dailyCard(cls) {
+    var m = metric() === 'viewers' ? 'accounts' : metric(), days = W().daily.slice(-400);
+    var pts = days.map(function (d) {
+      return { label: d.day.slice(8) + '/' + d.day.slice(5, 7), tipTitle: d.day, value: d[m], tip: [hrs(d.hours), num(d.plays) + ' plays', num(d.accounts) + ' accounts'] };
+    });
+    return card('Day by day', METRIC[metric()] + ', UK time', days.length ? plot(pts, function (v) { return fmt(v); }, days.length > 45) : null,
+      { head: ['Day', 'Hours', 'Plays', 'Accounts'], rows: days.slice().reverse().map(function (d) { return [d.day, hrs(d.hours), num(d.plays), num(d.accounts)]; }) }, cls || 'wide');
+  }
+  function kindsCard(cls) {
+    var m = metric(), parts = ['episode', 'film', 'other'].map(function (k) {
+      var e = W().kinds.filter(function (x) { return x.kind === k; })[0];
+      return { label: KIND[k][0], color: KIND[k][1], value: e ? e[m] : 0, e: e };
+    });
+    return card('Shows and films', METRIC[m], sum(parts, function (p) { return p.value; }) ? segments(parts, function (v) { return fmt(v, m); }) : null,
+      { head: ['Kind', 'Hours', 'Accounts', 'Plays'], rows: parts.filter(function (p) { return p.e; }).map(function (p) { return [p.label, hrs(p.e.hours), num(p.e.viewers), num(p.e.plays)]; }) }, cls);
   }
 
-  form.addEventListener('submit', function (e) {
-    e.preventDefault();
+  var PAGES = {
+    overview: function (g) {
+      var t = W().totals, tiles = el('div', 'tiles');
+      tiles.appendChild(tile('hours watched', hrs(t.hours).replace(' h', ''), 'by signed-in accounts', true));
+      tiles.appendChild(tile('plays', num(t.plays), num(t.finished) + ' finished (' + pct(t.finished, t.plays) + ')'));
+      tiles.appendChild(tile('titles watched', num(t.titles)));
+      tiles.appendChild(tile('accounts watching', num(t.active), 'of ' + num(t.accounts) + ' signed up'));
+      tiles.appendChild(tile('devices signed in', num(t.devices), W().devices.map(function (d) { return d.n + ' ' + d.kind; }).join(', ')));
+      tiles.appendChild(tile('watching live now', num(sum(Object.keys(data.usage.watching), function (k) { return data.usage.watching[k]; })), 'all devices, signed in or not'));
+      out.insertBefore(tiles, g);
+      g.appendChild(dailyCard());
+      g.appendChild(topTitles('Most watched', null, W().titles, 10));
+      g.appendChild(kindsCard());
+      var rising = W().rising.slice(0, 10);
+      g.appendChild(card('On the way up', 'plays in the last 7 days against the 7 before', rank(rising.map(function (t) {
+        return { label: t.name, sub: t.year || '', img: poster(t), value: t.recent - t.before, tip: [num(t.recent) + ' plays this week', num(t.before) + ' the week before'] };
+      }), function (v) { return '+' + num(v); }), { head: ['Title', 'This week', 'Week before'], rows: rising.map(function (t) { return [titled(t), num(t.recent), num(t.before)]; }) }));
+    },
+    titles: function (g) {
+      var all = W().titles;
+      g.appendChild(topTitles('Top shows', null, all.filter(function (t) { return t.kind === 'episode'; }), 20));
+      g.appendChild(topTitles('Top films', null, all.filter(function (t) { return t.kind === 'film'; }), 20));
+      var binge = top(all.filter(function (t) { return t.episodes > 1; }), function (t) { return t.episodes / t.viewers; }, 15);
+      g.appendChild(card('Most binged', 'episodes per account', rank(binge.map(function (t) {
+        return { label: t.name, sub: t.year || '', img: poster(t), value: t.episodes / t.viewers, tip: [num(t.episodes) + ' different episodes', num(t.viewers) + ' accounts'] };
+      }), function (v) { return (Math.round(v * 10) / 10).toLocaleString('en-GB'); }), { head: ['Title', 'Episodes', 'Accounts'], rows: binge.map(function (t) { return [titled(t), num(t.episodes), num(t.viewers)]; }) }));
+      var shared = top(all.filter(function (t) { return t.viewers > 1; }), function (t) { return t.viewers * 1000 + t.hours; }, 15);
+      g.appendChild(card('Watched by the most accounts', 'titles more than one account watched', rank(shared.map(titleRow('viewers')), num), titleTable(shared)));
+      g.appendChild(card('Every title', all.length + ' titles, by hours watched', table(titleTable(all).head, titleTable(all).rows), null, 'wide'));
+    },
+    genres: function (g) {
+      var m = metric(), genres = top(W().genres, function (x) { return x[m]; }, 20);
+      g.appendChild(card('Genres', METRIC[m] + '. A title counts under each of its genres', rank(genres.map(function (x) {
+        return { label: x.genre, value: x[m], tip: [hrs(x.hours), num(x.viewers) + ' accounts', num(x.plays) + ' plays', num(x.titles) + ' titles'] };
+      }), function (v) { return fmt(v, m); }), { head: ['Genre', 'Hours', 'Accounts', 'Plays', 'Titles'], rows: genres.map(function (x) { return [x.genre, hrs(x.hours), num(x.viewers), num(x.plays), num(x.titles)]; }) }));
+      g.appendChild(kindsCard());
+      var dm = m === 'viewers' ? 'titles' : m, decades = W().decades;
+      g.appendChild(card('When it was made', (dm === 'titles' ? 'Titles' : METRIC[dm]) + ' by decade of release', plot(decades.map(function (d) {
+        return { label: d.decade + 's', value: d[dm], tip: [hrs(d.hours), num(d.plays) + ' plays', num(d.titles) + ' titles'] };
+      }), function (v) { return dm === 'hours' ? hrs(v) : num(v); }), { head: ['Decade', 'Hours', 'Plays', 'Titles'], rows: decades.map(function (d) { return [d.decade + 's', hrs(d.hours), num(d.plays), num(d.titles)]; }) }));
+      var countries = W().countries.slice(0, 12);
+      g.appendChild(card('Where it was made', 'Hours watched', rank(countries.map(function (c) {
+        return { label: c.country, value: c.hours, tip: [hrs(c.hours), num(c.plays) + ' plays', num(c.titles) + ' titles'] };
+      }), hrs), { head: ['Country', 'Hours', 'Plays', 'Titles'], rows: countries.map(function (c) { return [c.country, hrs(c.hours), num(c.plays), num(c.titles)]; }) }));
+      var ratings = W().ratings;
+      g.appendChild(card('How well rated', 'Titles watched, by IMDb score', sum(ratings, Number) ? plot(ratings.map(function (n, i) {
+        return { label: i + (i === 9 ? '+' : ''), tipTitle: 'IMDb ' + i + ' to ' + (i + 1), value: n, tip: [num(n) + ' titles'] };
+      }), num) : null, { head: ['IMDb score', 'Titles'], rows: ratings.map(function (n, i) { return [i + ' to ' + (i + 1), num(n)]; }).filter(function (r) { return r[1] !== '0'; }) }));
+      var named = W().totals;
+      if (named.named < named.titles) g.appendChild(card('Still being looked up', '', el('p', 'muted', (named.titles - named.named) + ' of ' + named.titles + ' titles have no name, year or genre yet. They are looked up a few hundred at a time; some ids no catalogue knows.'), null));
+    },
+    when: function (g) {
+      var grid = W().heat, any = sum(grid, function (r) { return sum(r, Number); });
+      var rows = [];
+      grid.forEach(function (r, d) { r.forEach(function (v, h) { if (v) rows.push([DAYS[d], String(h).padStart(2, '0') + ':00', num(v)]); }); });
+      g.appendChild(card('When people watch', 'Plays by day and hour, UK time', any ? heat(grid) : null, { head: ['Day', 'Hour', 'Plays'], rows: rows }, 'wide'));
+      var byHour = grid[0].map(function (_, h) { return sum(grid, function (r) { return r[h]; }); });
+      g.appendChild(card('By hour', 'Plays, UK time', any ? plot(byHour.map(function (v, h) { return { label: String(h).padStart(2, '0'), tipTitle: String(h).padStart(2, '0') + ':00', value: v, tip: [num(v) + ' plays'] }; }), num) : null,
+        { head: ['Hour', 'Plays'], rows: byHour.map(function (v, h) { return [String(h).padStart(2, '0') + ':00', num(v)]; }) }));
+      var byDay = grid.map(function (r) { return sum(r, Number); });
+      g.appendChild(card('By day of the week', 'Plays', any ? plot(byDay.map(function (v, d) { return { label: DAYS[d], value: v, tip: [num(v) + ' plays'] }; }), num) : null,
+        { head: ['Day', 'Plays'], rows: byDay.map(function (v, d) { return [DAYS[d], num(v)]; }) }));
+      g.appendChild(dailyCard());
+    },
+    finishing: function (g) {
+      var c = W().completion, total = sum(c, Number), t = W().totals, tiles = el('div', 'tiles');
+      tiles.appendChild(tile('of plays finished', pct(t.finished, t.plays), num(t.finished) + ' of ' + num(t.plays), true));
+      tiles.appendChild(tile('given up in the first 10%', pct(c[0], total), num(c[0]) + ' plays'));
+      tiles.appendChild(tile('left past half way', pct(sum(c.slice(5, 9), Number), total), 'started, more than half seen, not finished'));
+      out.insertBefore(tiles, g);
+      g.appendChild(card('How far people get', 'Plays by how much of the film or episode was seen', total ? plot(c.map(function (n, i) {
+        return { label: i === 9 ? 'done' : i * 10 + '%', tipTitle: i === 9 ? '90% to the end, or marked watched' : i * 10 + '% to ' + (i + 1) * 10 + '%', value: n, tip: [num(n) + ' plays', pct(n, total)] };
+      }), num) : null, { head: ['Seen', 'Plays', 'Share'], rows: c.map(function (n, i) { return [i === 9 ? '90% to the end' : i * 10 + '% to ' + (i + 1) * 10 + '%', num(n), pct(n, total)]; }) }, 'wide'));
+      var enough = W().titles.filter(function (x) { return x.plays >= 3; });
+      var rate = function (x) { return x.finished / x.plays; };
+      var mk = function (list, left) { return rank(list.map(function (x) { return { label: x.name, sub: x.year || '', img: poster(x), value: (left ? 1 - rate(x) : rate(x)) * 100, tip: [num(x.finished) + ' of ' + num(x.plays) + ' plays finished'] }; }), function (v) { return Math.round(v) + '%'; }); };
+      var tb = function (list) { return { head: ['Title', 'Finished', 'Plays', 'Rate'], rows: list.map(function (x) { return [titled(x), num(x.finished), num(x.plays), pct(x.finished, x.plays)]; }) }; };
+      var kept = top(enough, function (x) { return rate(x) * 1e6 + x.plays; }, 12), dropped = top(enough, function (x) { return -rate(x) * 1e6 + x.plays; }, 12);
+      g.appendChild(card('Finished most often', 'share of plays finished, titles with 3 or more plays', mk(kept), tb(kept)));
+      g.appendChild(card('Left unfinished most often', 'share of plays not finished, titles with 3 or more plays', mk(dropped, true), tb(dropped)));
+    },
+    list: function (g) {
+      var list = W().list, saved = top(list, function (x) { return x.adds * 1000 + x.watched_by; }, 20);
+      var row = function (x) { return { label: x.name, sub: x.year || '', img: poster(x), value: x.adds, tip: [num(x.adds) + ' accounts saved it', num(x.watched_by) + ' have watched some of it'] }; };
+      var tb = function (l) { return { head: ['Title', 'Kind', 'Saved by', 'Watched by'], rows: l.map(function (x) { return [titled(x), x.type === 'movie' ? 'Film' : 'Show', num(x.adds), num(x.watched_by)]; }) }; };
+      g.appendChild(card('Saved to My list most', 'accounts with it on their list', rank(saved.map(row), num), tb(saved)));
+      var unwatched = list.filter(function (x) { return !x.watched_by; }).slice(0, 20);
+      g.appendChild(card('Saved, never started', 'on a list, watched by nobody', rank(unwatched.map(row), num), tb(unwatched)));
+      var kinds = [{ label: 'Shows', color: 'var(--s1)', value: list.filter(function (x) { return x.type !== 'movie'; }).length }, { label: 'Films', color: 'var(--s2)', value: list.filter(function (x) { return x.type === 'movie'; }).length }];
+      g.appendChild(card('What gets saved', 'titles on lists', list.length ? segments(kinds, num) : null, { head: ['Kind', 'Titles'], rows: kinds.map(function (k) { return [k.label, num(k.value)]; }) }));
+    },
+    app: function (g) {
+      var u = data.usage, total = {}, byDay = {}, plat = {}, version = {};
+      u.rows.forEach(function (r) {
+        var key = r[3], n = r[4];
+        if (key.indexOf('live.') === 0) return;
+        total[key] = (total[key] || 0) + n;
+        (byDay[r[0]] = byDay[r[0]] || {})[key] = ((byDay[r[0]] || {})[key] || 0) + n;
+        if (key === 'active.day') { plat[r[1]] = (plat[r[1]] || 0) + n; version[r[2]] = (version[r[2]] || 0) + n; }
+      });
+      var get = function (k) { return total[k] || 0; };
+      var prefix = function (p) { return Object.keys(total).filter(function (k) { return k.indexOf(p) === 0; }).map(function (k) { return { label: k.slice(p.length), value: total[k] }; }).sort(function (a, b) { return b.value - a.value; }); };
+      var days = Object.keys(byDay).sort(), today = byDay[u.today] || {};
+      var monday = new Date(u.today + 'T00:00:00Z');
+      monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7));
+      var weekFrom = monday.toISOString().slice(0, 10), monthFrom = u.today.slice(0, 8) + '01';
+      var tiles = el('div', 'tiles');
+      tiles.appendChild(tile('devices today', num(today['active.day'] || 0), 'every device that accepted the terms', true));
+      tiles.appendChild(tile('devices this week', num(sum(days.filter(function (d) { return d >= weekFrom; }), function (d) { return byDay[d]['active.week'] || 0; }))));
+      tiles.appendChild(tile('devices this month', num(sum(days.filter(function (d) { return d >= monthFrom; }), function (d) { return byDay[d]['active.month'] || 0; }))));
+      tiles.appendChild(tile('new devices', num(get('age.new')), 'first day with the app, this period'));
+      out.insertBefore(tiles, g);
+      var bars = function (title, note, rows, f, head) { return card(title, note, rank(rows, f || num), { head: head || ['', 'Count'], rows: rows.map(function (r) { return [r.label, (f || num)(r.value)]; }) }); };
+      g.appendChild(card('Devices per day', 'anonymous daily reports (UTC)', days.length ? plot(days.map(function (d) {
+        return { label: d.slice(8) + '/' + d.slice(5, 7), tipTitle: d, value: byDay[d]['active.day'] || 0, tip: [num(byDay[d]['active.day'] || 0) + ' devices', num(byDay[d]['age.new'] || 0) + ' new'] };
+      }), num, days.length > 45) : null, { head: ['Day', 'Devices', 'New'], rows: days.slice().reverse().map(function (d) { return [d, num(byDay[d]['active.day'] || 0), num(byDay[d]['age.new'] || 0)]; }) }, 'wide'));
+      g.appendChild(bars('Sections opened', 'times opened', prefix('open.')));
+      var kinds = prefix('mins.').map(function (r) { return { label: r.label, value: r.value / 60, tip: [hrs(r.value / 60), num(get('play.' + r.label)) + ' plays', num(get('fail.' + r.label)) + ' failed to play'] }; });
+      g.appendChild(card('Hours by kind', 'every device, signed in or not', rank(kinds, hrs), { head: ['Kind', 'Hours', 'Plays', 'Failed'], rows: kinds.map(function (k) { return [k.label, hrs(k.value), num(get('play.' + k.label)), num(get('fail.' + k.label))]; }) }));
+      g.appendChild(bars('Features used', 'times used', prefix('use.')));
+      g.appendChild(bars('Kinds of device', 'device-days', Object.keys(plat).map(function (k) { return { label: k, value: plat[k] }; }).sort(function (a, b) { return b.value - a.value; })));
+      g.appendChild(bars('App versions', 'device-days', Object.keys(version).map(function (k) { return { label: k || '-', value: version[k] }; }).sort(function (a, b) { return b.value - a.value; })));
+      g.appendChild(bars('How devices are set up', 'device-days', prefix('is.')));
+      var ages = [['new', 'First day'], ['week', 'Under a week'], ['month', 'Under a month'], ['quarter', 'Under 3 months'], ['older', '3 months or more']];
+      g.appendChild(card('How long the app has been installed', 'device-days', get('active.day') ? plot(ages.map(function (a) { return { label: a[1], value: get('age.' + a[0]), tip: [num(get('age.' + a[0])) + ' device-days'] }; }), num) : null,
+        { head: ['Age', 'Device-days'], rows: ages.map(function (a) { return [a[1], num(get('age.' + a[0]))]; }) }));
+    },
+    live: function (g) {
+      var u = data.usage, mins = {}, peak = {};
+      u.rows.forEach(function (r) {
+        if (r[3].indexOf('live.mins.') === 0) mins[r[3].slice(10)] = (mins[r[3].slice(10)] || 0) + r[4];
+        if (r[3].indexOf('live.peak.') === 0) peak[r[3].slice(10)] = Math.max(peak[r[3].slice(10)] || 0, r[4]);
+      });
+      var chans = Object.keys(u.watching).filter(function (c) { return c !== 'other' || mins.other || u.watching.other; });
+      var tb = { head: ['Channel', 'Watching now', 'Most at once', 'Viewer-hours'], rows: chans.map(function (c) { return [c, num(u.watching[c] || 0), num(peak[c] || 0), hrs((mins[c] || 0) / 60)]; }) };
+      var hoursRows = chans.map(function (c) { return { label: c, value: (mins[c] || 0) / 60, tip: [hrs((mins[c] || 0) / 60), 'most at once: ' + num(peak[c] || 0)] }; }).sort(function (a, b) { return b.value - a.value; });
+      g.appendChild(card('Viewer-hours by channel', 'every device, this period', sum(hoursRows, function (r) { return r.value; }) ? rank(hoursRows, hrs) : null, tb));
+      var now = chans.map(function (c) { return { label: c, value: u.watching[c] || 0 }; }).sort(function (a, b) { return b.value - a.value; });
+      g.appendChild(card('Watching right now', 'devices tuned in', sum(now, function (r) { return r.value; }) ? rank(now, num) : null, tb));
+      var peaks = chans.map(function (c) { return { label: c, value: peak[c] || 0 }; }).sort(function (a, b) { return b.value - a.value; });
+      g.appendChild(card('Most at once', 'highest count this period', sum(peaks, function (r) { return r.value; }) ? rank(peaks, num) : null, tb));
+    },
+  };
+
+  function render() {
+    hideTip();
+    $('tabs').textContent = '';
+    TABS.forEach(function (t) {
+      var b = el('button', '', t[1]);
+      b.type = 'button';
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', String(t[0] === tab));
+      b.addEventListener('click', function () { tab = t[0]; history.replaceState(null, '', '#' + tab); render(); });
+      $('tabs').appendChild(b);
+    });
+    out.textContent = '';
+    out.className = '';
+    if (!data) return;
+    draws = [];
+    var g = el('div', 'grid');
+    out.appendChild(g);
+    PAGES[tab](g);
+    draws.forEach(function (d) { d(); });
+  }
+
+  function load() {
     error.textContent = '';
     var token = tokenBox.value.trim();
     if (!token) return;
-    fetch('/api/stats?days=' + encodeURIComponent(document.getElementById('days').value), {
-      headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
-    }).then(function (r) {
-      return r.json().then(function (body) {
-        if (!r.ok) throw new Error(body.error || String(r.status));
-        try { sessionStorage.setItem('stats-token', token); } catch (e) {}
-        draw(body);
+    var days = $('days').value, headers = { Authorization: 'Bearer ' + token, Accept: 'application/json' };
+    var get = function (url) {
+      return fetch(url, { headers: headers }).then(function (r) {
+        return r.json().then(function (body) { if (!r.ok) throw new Error(body.error || String(r.status)); return body; });
       });
+    };
+    out.className = 'stale';
+    Promise.all([get('/api/stats/watching?days=' + days), get('/api/stats?days=' + (days === '0' ? 400 : days))]).then(function (got) {
+      try { sessionStorage.setItem('stats-token', token); } catch (e) {}
+      data = { watching: got[0], usage: got[1] };
+      render();
     }).catch(function (e) {
-      out.textContent = '';
+      out.className = '';
       error.textContent = 'Could not load: ' + e.message;
     });
-  });
-  if (tokenBox.value) form.requestSubmit();
+  }
+
+  form.addEventListener('submit', function (e) { e.preventDefault(); load(); });
+  $('days').addEventListener('change', load);
+  $('metric').addEventListener('change', render);
+  var resizing = 0;
+  window.addEventListener('resize', function () { clearTimeout(resizing); resizing = setTimeout(function () { draws.forEach(function (d) { d(); }); }, 150); });
+  render();
+  if (tokenBox.value) load();
 })();
 </script>
 </body>
